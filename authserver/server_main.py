@@ -45,7 +45,7 @@ except Exception as e:
     show_prelog_and_exit()
 
 
-thobberchars = ["|", "/", "-", "\\"]
+throbberchars = ["|", "/", "—", "\\"]
 
 try:
     with open(
@@ -93,6 +93,23 @@ def splash(stdscr):
     time.sleep(1)
 
 
+def draw_console_ui(stdscr, throbber_char, input_buffer):
+    stdscr.clear()
+    stdscr.addstr(0, 0, f'####### bNET auth v{version} ########')
+    stdscr.addstr(1, 0, f'##### Protocol: {protocol} v{protocol_version} #####')
+    stdscr.addstr(2, 0, f'#  {len(clients)} Clients connected')
+    runmarker = 'Server is running...' if server_running else 'Server is not running...'
+    stdscr.addstr(3, 0, f'#  {runmarker} {throbber_char}')
+    stdscr.addstr(4, 0, '')
+    stdscr.addstr(5, 0, f'Status: {status}')
+    stdscr.addstr(6, 0, '### log ###')
+    for idx, message in enumerate(last_logmessages):
+        stdscr.addstr(7 + idx, 0, f"# {message}")
+    stdscr.addstr(8 + len(last_logmessages), 0, 'Input: ')
+    stdscr.addstr(8 + len(last_logmessages), 7, input_buffer)
+    stdscr.refresh()
+
+
 def console(stdscr):
     global status
 
@@ -101,40 +118,26 @@ def console(stdscr):
     stdscr.clear()
 
     input_buffer = ""  # Buffer to hold user input
+    throbber_index = 0
+    last_throbber_update = time.time()  # Track the last update time
+    throbber_char = None
 
     while True:
-        if server_running:
-            runmarker = 'Server is running...'
+        current_time = time.time()
+
+        # Update throbber every 100 milliseconds
+        if current_time - last_throbber_update >= 0.1:
+            throbber_char = throbberchars[throbber_index % len(throbberchars)]
+            last_throbber_update = current_time
+            throbber_index += 1
+
+        if throbber_char:
+            draw_console_ui(stdscr, throbber_char, input_buffer)
         else:
-            runmarker = 'Server is not running...'
+            draw_console_ui(stdscr, "$", input_buffer)
 
-        for i in thobberchars:
-            stdscr.clear()  # Clear the screen
-            stdscr.addstr(0, 0, f'####### bNET auth v{version} ########')
-            stdscr.addstr(
-                1, 0,
-                f'##### Protocol: {protocol} v{protocol_version} #####'
-            )
-            stdscr.addstr(2, 0, f'#  {len(clients)} Clients connected')
-            stdscr.addstr(3, 0, f'#  {runmarker} {i}')
-            stdscr.addstr(4, 0, '')
-            stdscr.addstr(5, 0, f'Status: {status}')
-            stdscr.addstr(6, 0, '### log ###')
-
-            # Print log messages
-            for idx, message in enumerate(last_logmessages):
-                stdscr.addstr(7 + idx, 0, f"# {message}")
-
-            # Display input prompt
-            stdscr.addstr(8 + len(last_logmessages), 0, 'Input: ')
-
-            # Display current input
-            stdscr.addstr(8 + len(last_logmessages), 7, input_buffer)
-
-            stdscr.refresh()  # Refresh the screen to show changes
-
-            # Handle input
-            key = stdscr.getch()  # Get user input
+        key = stdscr.getch()  # Get user input
+        if key != -1:
             if key in (curses.KEY_BACKSPACE, 127, 8):  # Handle backspace
                 input_buffer = input_buffer[:-1]
             elif key == 10:  # Enter key
@@ -142,9 +145,9 @@ def console(stdscr):
                 handle_command(input_buffer)
                 input_buffer = ""  # Clear the input buffer after processing
             elif 32 <= key <= 126:  # Printable characters
-                input_buffer += chr(key)  # Add character to input buffehelpr
+                input_buffer += chr(key)  # Add character to input buffer
 
-            time.sleep(0.1)  # Throttle the loop to avoid high CPU usage
+        time.sleep(0.01)  # Throttle the loop to avoid high CPU usage
 
 
 def handle_command(command):

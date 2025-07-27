@@ -5,6 +5,7 @@ import asyncio
 import threading
 import curses
 import json
+import sys
 
 
 def clear_term():
@@ -13,8 +14,8 @@ def clear_term():
 
 version = "1"
 protocol = "bNET"
-protocol_version = "1"
-software_version = "3025a"
+protocol_ver = "1"
+software_ver = "3025b"
 software_name = "bNET Authentication Server"
 software_author = "Bleached Development"
 
@@ -96,9 +97,10 @@ def splash(stdscr):
 def draw_console_ui(stdscr, throbber_char, input_buffer):
     stdscr.clear()
     stdscr.addstr(0, 0, f'####### bNET auth v{version} ########')
-    stdscr.addstr(1, 0, f'##### Protocol: {protocol} v{protocol_version} #####')
+    stdscr.addstr(1, 0, f'##### Protocol: {protocol} v{protocol_ver} #####')
     stdscr.addstr(2, 0, f'#  {len(clients)} Clients connected')
-    runmarker = 'Server is running...' if server_running else 'Server is not running...'
+    runmarker = 'Server is running...' if server_running else \
+        'Server is not running...'
     stdscr.addstr(3, 0, f'#  {runmarker} {throbber_char}')
     stdscr.addstr(4, 0, '')
     stdscr.addstr(5, 0, f'Status: {status}')
@@ -113,13 +115,14 @@ def draw_console_ui(stdscr, throbber_char, input_buffer):
 def console(stdscr):
     global status
 
-    curses.curs_set(0)  # Hide the cursor
+    curses.curs_set(1)  # Show the cursor
     stdscr.nodelay(1)   # Don't block on input
     stdscr.clear()
 
     input_buffer = ""  # Buffer to hold user input
     throbber_index = 0
     last_throbber_update = time.time()  # Track the last update time
+    last_cursor_flash = time.time()
     throbber_char = None
 
     while True:
@@ -131,6 +134,11 @@ def console(stdscr):
             last_throbber_update = current_time
             throbber_index += 1
 
+        # Flash the cursor every second
+        if current_time - last_cursor_flash >= 1:
+            curses.curs_set(1 if curses.curs_set(0) == 0 else 0)
+            last_cursor_flash = current_time
+
         if throbber_char:
             draw_console_ui(stdscr, throbber_char, input_buffer)
         else:
@@ -140,12 +148,17 @@ def console(stdscr):
         if key != -1:
             if key in (curses.KEY_BACKSPACE, 127, 8):  # Handle backspace
                 input_buffer = input_buffer[:-1]
+                curses.curs_set(1)
             elif key == 10:  # Enter key
                 # Process the input (e.g., log it, execute a command, etc.)
                 handle_command(input_buffer)
                 input_buffer = ""  # Clear the input buffer after processing
             elif 32 <= key <= 126:  # Printable characters
                 input_buffer += chr(key)  # Add character to input buffer
+                curses.curs_set(1)
+
+        # put the cursor at the end of the input line
+        stdscr.move(8 + len(last_logmessages), len(input_buffer))
 
         time.sleep(0.01)  # Throttle the loop to avoid high CPU usage
 
@@ -157,6 +170,10 @@ def handle_command(command):
         log_message("Available commands: help, status")
     elif command.lower() == "status":
         log_message(f"Current status: {status}")
+    elif command.lower() == "exit":
+        log_message("killing server...")
+        status = "Exiting..."
+        sys.exit(0)
     else:
         log_message(f"Unknown command: {command}")
 
@@ -204,7 +221,6 @@ async def run_server():
 
 async def handle_client(client_socket):
     global status
-    auth_expected = False
 
     try:
         while True:
@@ -219,37 +235,90 @@ async def handle_client(client_socket):
             request = request.decode("utf-8")
             log_message(f"Received: {request}")
 
-            # need to make this better
-            if request.lower() == "auth":
-                auth_expected = True
+            # process requests
+            if request.startswith("CHECK::"):
+                check_request = request.split("::")[1]
+                if check_request == "USER":
+                    bID = request.split("::")[2]
+                    password = request.split("::")[3]
+                    log_message(f"Checking bID: {bID}")
 
-                response = "Please send your authentication code.".encode(
-                    "utf-8")
+                    # check if bID exists in the data
+                    with open(default_userdata_path, 'r') as json_file:
+                        data = json.load(json_file)
 
-                client_socket.send(response)
-            elif auth_expected:
-                log_message(f"Authentication code received: {request}")
-                response = "Authentication successful.".encode("utf-8")
-                client_socket.send(response)
-                auth_expected = False
+                    if bID in data["bNETauth_data"]["clients"]:
+
+                        # check if password matches
+                        if data["bNETauth_data"]["clients"][bID]["password"] == password:
+                            response = "OK"
+                        else:
+                            response = "INUSE"
+                    else:
+                        response = "SENDDATA"
+
+            elif request.startswith("REGISTER::"):
+                bID = request.split("::")[1]
+                password = request.split("::")[2]
+                log_message(f"Registering bID: {bID}")
+
+                # check if bID already exists
+                with open(default_userdata_path, 'r') as json_file:
+                    data = json.load(json_file)
+
+                if bID in data["bNETauth_data"]["clients"]:
+                    # if bID exists check if password matches
+                    if data["bNETauth_data"]["clients"][bID]["password"] == password:
+                        # set client status to online
+                        data["bNETauth_data"]["clients"][bID]["data"]["status"] = "online"
+                        with open(default_userdata_path, 'w') as json_file:
+                            json.dump(data, json_file, indent=4)
+                        response = "OK"
+
+                else:
+                    # register the new client
+                    data["bNETauth_data"]["clients"][bID] = {
+                        "password": password,
+                        "data": {"status": "online"}
+                    }
+                    with open(default_userdata_path, 'w') as json_file:
+                        json.dump(data, json_file, indent=4)
+                    log_message(f"Registered new bID: {bID}")
+                    response = "OK"
             else:
-                response = \
-                    "Unknown command. \
-                    Please send 'auth' to start \
-                    authentication.".encode("utf-8")
+                log_message("Unknown request")
+                client_socket.send("UNKNOWN".encode('utf-8'))
 
-                client_socket.send(response)
+            if response:
+                log_message(f"Sending response: {response}")
+                client_socket.send(response.encode('utf-8'))
 
     except socket.timeout:
         log_message("Client timeout, closing connection")
     except Exception as e:
         log_message(f"Error handling client: {e}")
-    finally:
-        client_socket.close()
-        log_message("Connection to client closed")
-        status = "Listening..."
-        # Remove the client from the clients list
         clients.remove(client_socket)
+    finally:
+        # set the client status to offline
+        try:
+            with open(default_userdata_path, 'r') as json_file:
+                data = json.load(json_file)
+
+            for bID in data["bNETauth_data"]["clients"]:
+                if data["bNETauth_data"]["clients"][bID]["data"]["status"] == "online":
+                    data["bNETauth_data"]["clients"][bID]["data"]["status"] = "offline"
+
+            with open(default_userdata_path, 'w') as json_file:
+                json.dump(data, json_file, indent=4)
+        except Exception as e:
+            log_message(f"Error updating client status: {e}")
+
+        # Close the client socket
+        client_socket.send("CLOSED".encode('utf-8'))
+        client_socket.close()
+        clients.remove(client_socket)
+        log_message("Connection socket closed")
+        status = "Listening..."
 
 
 def init():

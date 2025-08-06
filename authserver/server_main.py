@@ -204,8 +204,7 @@ async def run_server():
                     server.accept
                     )
 
-            log_message(f"Accepted connection from {
-                client_address[0]}:{client_address[1]}")
+            log_message(f"Accepted connection from {client_address[0]}:{client_address[1]}")
 
             status = "Client connected"
 
@@ -352,9 +351,7 @@ def init():
             except Exception as e:
                 log_message(f'Unable to make Data folder; {e}')
             finally:
-                log_message(
-                    f'Data folder created at {os.path.abspath(
-                        default_storage_path)}')
+                log_message(f'Data folder created at {os.path.abspath(default_storage_path)}')
         else:
             log_message('Data folder found')
     except Exception as e:

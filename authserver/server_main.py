@@ -47,6 +47,7 @@ except Exception as e:
 
 
 throbberchars = ["|", "/", "—", "\\"]
+throbberchars2 = ["_","—","‾","—"]
 
 try:
     with open(
@@ -61,6 +62,16 @@ total_logged = 0
 last_logmessages = []
 
 clients = []
+
+
+class Client:
+    def __init__(self, socket):
+        self.socket = socket
+        self.address = socket.getpeername()
+        self.bID = None
+
+    def __str__(self):
+        return f"Client({self.address[0]}:{self.address[1]})"
 
 
 def log_message(message):
@@ -174,6 +185,29 @@ def handle_command(command):
         log_message("killing server...")
         status = "Exiting..."
         sys.exit(0)
+    elif command.lower() == "test-listpeers":
+
+        peers = []
+
+        this_clientbID = "000000000000000000000000000000" # Dummy bID for testing
+
+        try:
+            with open(default_userdata_path, 'r') as json_file:
+                        data = json.load(json_file)
+
+            for bID, info in data["bNETauth_data"]["clients"].items():
+                if info["data"]["status"] == "offline" and bID != this_clientbID:
+                    # fake a client connection for testing
+                    peer_ip = "0.0.0.0"
+                    peer_port = "00000"
+                    # create tuple of bID,IP,PORT
+                    peer_entry = f"{bID};{peer_ip}:{peer_port}"
+                    peers.append(peer_entry)
+
+            response = "PEERS::" + "::".join(peers) if peers else "PEERS::NONE"
+            log_message(f"Test LISTPEERS result: {response}")
+        except Exception as e:
+            log_message(f"Error reading user data: {e}")
     else:
         log_message(f"Unknown command: {command}")
 
@@ -220,6 +254,7 @@ async def run_server():
 
 async def handle_client(client_socket):
     global status
+    this_clientbID = None
 
     try:
         while True:
@@ -234,7 +269,10 @@ async def handle_client(client_socket):
             request = request.decode("utf-8")
             log_message(f"Received: {request}")
 
-            # process requests
+            # >> >> Process requests
+
+            # Check request
+            # >> Checks if a bID is registered and if the password matches
             if request.startswith("CHECK::"):
                 check_request = request.split("::")[1]
                 if check_request == "USER":
@@ -243,47 +281,103 @@ async def handle_client(client_socket):
                     log_message(f"Checking bID: {bID}")
 
                     # check if bID exists in the data
-                    with open(default_userdata_path, 'r') as json_file:
-                        data = json.load(json_file)
+                    try:
+                        with open(default_userdata_path, 'r') as json_file:
+                            data = json.load(json_file)
 
-                    if bID in data["bNETauth_data"]["clients"]:
-
-                        # check if password matches
-                        if data["bNETauth_data"]["clients"][bID]["password"] == password:
-                            response = "OK"
+                        if bID in data["bNETauth_data"]["clients"]:
+                            # check if password matches
+                            if data["bNETauth_data"]["clients"][bID]["password"] == password:
+                                response = "OK"
+                            else:
+                                response = "INUSE"
                         else:
-                            response = "INUSE"
-                    else:
-                        response = "SENDDATA"
+                            response = "SENDDATA"
+                    except Exception as e:
+                        log_message(f"Error reading user data: {e}")
+                        response = "FAILED"
 
+                    
+
+            # Registration request
+            # >> Registers a new client or sets existing client's status to online
             elif request.startswith("REGISTER::"):
-                bID = request.split("::")[1]
+                thisbID = request.split("::")[1]
                 password = request.split("::")[2]
-                log_message(f"Registering bID: {bID}")
+                log_message(f"Registering bID: {thisbID}")
 
                 # check if bID already exists
                 with open(default_userdata_path, 'r') as json_file:
                     data = json.load(json_file)
 
-                if bID in data["bNETauth_data"]["clients"]:
+                # register the existing client as online
+                if thisbID in data["bNETauth_data"]["clients"]:
                     # if bID exists check if password matches
-                    if data["bNETauth_data"]["clients"][bID]["password"] == password:
+                    if data["bNETauth_data"]["clients"][thisbID]["password"] == password:
                         # set client status to online
-                        data["bNETauth_data"]["clients"][bID]["data"]["status"] = "online"
+                        data["bNETauth_data"]["clients"][thisbID]["data"]["status"] = "online"
                         with open(default_userdata_path, 'w') as json_file:
                             json.dump(data, json_file, indent=4)
                         response = "OK"
+                        this_clientbID = thisbID
 
                 else:
                     # register the new client
-                    data["bNETauth_data"]["clients"][bID] = {
+                    data["bNETauth_data"]["clients"][thisbID] = {
                         "password": password,
                         "data": {"status": "online"}
                     }
                     with open(default_userdata_path, 'w') as json_file:
                         json.dump(data, json_file, indent=4)
-                    log_message(f"Registered new bID: {bID}")
+                    log_message(f"Registered new bID: {thisbID}")
                     response = "OK"
+                    this_clientbID = thisbID
+
+
+            # List peers request
+            # >> Lists online clients to the requester & their connection info for p2p initiation
+            elif request.startswith("LISTPEERS"):
+                log_message(f"Listing peers to {client_socket.getpeername()}")
+
+                peers = []
+
+                try:
+                    with open(default_userdata_path, 'r') as json_file:
+                        data = json.load(json_file)
+
+                    # compile a list of online clients excluding the requester
+                    # format: bID,IP,PORT; bID,IP,PORT; ...
+
+                    for bID, info in data["bNETauth_data"]["clients"].items():
+                        if info["data"]["status"] == "online" and bID != this_clientbID:
+                            # get the IP and PORT from the clients list
+                            for c in clients:
+                                if isinstance(c, socket.socket):
+                                    if c.getpeername()[0] == client_socket.getpeername()[0]:
+                                        peer_ip = c.getpeername()[0]
+                                        peer_port = c.getpeername()[1]
+                                        # create tuple of bID,IP,PORT
+                                        peer_entry = f"{bID};{peer_ip}:{peer_port}"
+                                        peers.append(peer_entry)
+
+                    response = "PEERS::" + "::".join(peers) if peers else "PEERS::NONE"
+                except Exception as e:
+                    log_message(f"Error reading user data: {e}")
+                    response = "FAILED"
+                    continue
+                
+                
+
+
+                
+                
+                log_message(f"Compiled peer list: {response}")
+
+            # Ping request
+            #
+            elif request.startswith("PING"):
+                response = "PONG"
+
             else:
                 log_message("Unknown request")
                 client_socket.send("UNKNOWN".encode('utf-8'))
@@ -304,8 +398,8 @@ async def handle_client(client_socket):
                 data = json.load(json_file)
 
             for bID in data["bNETauth_data"]["clients"]:
-                if data["bNETauth_data"]["clients"][bID]["data"]["status"] == "online":
-                    data["bNETauth_data"]["clients"][bID]["data"]["status"] = "offline"
+                if data["bNETauth_data"]["clients"][this_clientbID]["data"]["status"] == "online":
+                    data["bNETauth_data"]["clients"][this_clientbID]["data"]["status"] = "offline"
 
             with open(default_userdata_path, 'w') as json_file:
                 json.dump(data, json_file, indent=4)

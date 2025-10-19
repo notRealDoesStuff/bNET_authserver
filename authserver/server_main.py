@@ -332,6 +332,7 @@ async def handle_client(client_socket):
                     log_message(f"Registered new bID: {thisbID}")
                     response = "OK"
                     this_clientbID = thisbID
+                    
 
 
             # List peers request
@@ -346,10 +347,8 @@ async def handle_client(client_socket):
                         data = json.load(json_file)
 
                     # compile a list of online clients excluding the requester
-                    # format: bID,IP,PORT; bID,IP,PORT; ...
-
                     for bID, info in data["bNETauth_data"]["clients"].items():
-                        if info["data"]["status"] == "online" and bID != this_clientbID:
+                        if info["data"]["status"] == "online" and info != this_clientbID:
                             # get the IP and PORT from the clients list
                             for c in clients:
                                 if isinstance(c, socket.socket):

@@ -47,7 +47,7 @@ except Exception as e:
 
 
 throbberchars = ["|", "/", "—", "\\"]
-throbberchars2 = ["_","—","‾","—"]
+throbberchars2 = ["_","—","‾"]
 
 try:
     with open(
@@ -65,9 +65,13 @@ clients = []
 
 
 class Client:
-    def __init__(self, socket):
-        self.socket = socket
-        self.address = socket.getpeername()
+    def __init__(self, sock, address=None):
+        self.socket = sock
+        try:
+            self.address = address if address is not None else self.socket.getpeername()
+        except OSError:
+            self.address = ("unknown", 0)
+        self.conn_port = None
         self.bID = None
 
     def __str__(self):
@@ -140,8 +144,8 @@ def console(stdscr):
         current_time = time.time()
 
         # Update throbber every 100 milliseconds
-        if current_time - last_throbber_update >= 0.1:
-            throbber_char = throbberchars[throbber_index % len(throbberchars)]
+        if current_time - last_throbber_update >= 0.35:
+            throbber_char = throbberchars2[throbber_index % len(throbberchars2)]
             last_throbber_update = current_time
             throbber_index += 1
 
@@ -178,7 +182,7 @@ def handle_command(command):
     global status
 
     if command.lower() == "help":
-        log_message("Available commands: help, status")
+        log_message("Available commands: help, status, exit, test-listpeers")
     elif command.lower() == "status":
         log_message(f"Current status: {status}")
     elif command.lower() == "exit":
@@ -208,6 +212,14 @@ def handle_command(command):
             log_message(f"Test LISTPEERS result: {response}")
         except Exception as e:
             log_message(f"Error reading user data: {e}")
+    elif command.lower() == "clients":
+        log_message(f"Connected clients: {len(clients)}")
+        for c in clients:
+            try:
+                addr = c.socket.getpeername()
+                log_message(f" - {addr[0]}:{addr[1]} conn_port: {getattr(c,'conn_port', None)} bID: {getattr(c,'bID', None)}")
+            except Exception:
+                log_message(f" - <disconnected client> conn_port: {getattr(c,'conn_port', None)} bID: {getattr(c,'bID', None)}")
     else:
         log_message(f"Unknown command: {command}")
 
@@ -230,6 +242,8 @@ async def run_server():
     status = "Listening..."
 
     while True:
+        os.system('title bNET Auth - Status: ' + status)
+
         try:
             client_socket, client_address = \
                 await \
@@ -242,17 +256,20 @@ async def run_server():
 
             status = "Client connected"
 
-            # Add the client socket to the clients list
-            clients.append(client_socket)
+            # Add socket to Client class instance
+            client = Client(client_socket, client_address)
+
+            # Add the client object to the clients list
+            clients.append(client)
 
             # Handle client in a separate task
-            asyncio.create_task(handle_client(client_socket))
+            asyncio.create_task(handle_client(client))
 
         except Exception as e:
             log_message(f"Error accepting connection: {e}")
 
 
-async def handle_client(client_socket):
+async def handle_client(client):
     global status
     this_clientbID = None
 
@@ -260,7 +277,7 @@ async def handle_client(client_socket):
         while True:
             request = await \
                 asyncio.get_event_loop().run_in_executor(
-                    None, client_socket.recv, 1024)
+                    None, client.socket.recv, 1024)
 
             if not request:
                 log_message("Client disconnected")
@@ -304,6 +321,7 @@ async def handle_client(client_socket):
             elif request.startswith("REGISTER::"):
                 thisbID = request.split("::")[1]
                 password = request.split("::")[2]
+                c_port = request.split("::")[3]
                 log_message(f"Registering bID: {thisbID}")
 
                 # check if bID already exists
@@ -319,6 +337,9 @@ async def handle_client(client_socket):
                         with open(default_userdata_path, 'w') as json_file:
                             json.dump(data, json_file, indent=4)
                         response = "OK"
+
+                        client.conn_port = c_port
+                        client.bID = thisbID
                         this_clientbID = thisbID
 
                 else:
@@ -331,16 +352,18 @@ async def handle_client(client_socket):
                         json.dump(data, json_file, indent=4)
                     log_message(f"Registered new bID: {thisbID}")
                     response = "OK"
+                    client.conn_port = c_port
+                    client.bID = thisbID
                     this_clientbID = thisbID
-                    
 
 
             # List peers request
             # >> Lists online clients to the requester & their connection info for p2p initiation
             elif request.startswith("LISTPEERS"):
-                log_message(f"Listing peers to {client_socket.getpeername()}")
+                log_message(f"Listing peers to {client.socket.getpeername()}")
 
                 peers = []
+                response = "PEERS::NONE"
 
                 try:
                     with open(default_userdata_path, 'r') as json_file:
@@ -348,28 +371,38 @@ async def handle_client(client_socket):
 
                     # compile a list of online clients excluding the requester
                     for bID, info in data["bNETauth_data"]["clients"].items():
-                        if info["data"]["status"] == "online" and info != this_clientbID:
+                        if info["data"]["status"] == "online" and bID != this_clientbID:
                             # get the IP and PORT from the clients list
+                            peer_ip = None
+                            peer_port = None
+                            peer_conn_port = None
                             for c in clients:
-                                if isinstance(c, socket.socket):
-                                    if c.getpeername()[0] == client_socket.getpeername()[0]:
-                                        peer_ip = c.getpeername()[0]
-                                        peer_port = c.getpeername()[1]
-                                        # create tuple of bID,IP,PORT
-                                        peer_entry = f"{bID};{peer_ip}:{peer_port}"
-                                        peers.append(peer_entry)
+                                # Only consider Client instances
+                                if not isinstance(c, Client):
+                                    continue
+                                try:
+                                    # skip the requester entry
+                                    if c.socket.getpeername() == client.socket.getpeername():
+                                        continue
+                                    # only collect IP/port when the bID matches this entry
+                                    if c.bID == bID:
+                                        peer_ip = c.socket.getpeername()[0]
+                                        peer_port = c.socket.getpeername()[1]
+                                        peer_conn_port = c.conn_port
+                                        break
+                                except Exception:
+                                    continue
+
+                            if peer_ip and peer_conn_port:
+                                # create tuple of bID,IP,PORT
+                                peer_entry = f"{bID};{peer_ip}:{peer_conn_port}"
+                                peers.append(peer_entry)
 
                     response = "PEERS::" + "::".join(peers) if peers else "PEERS::NONE"
                 except Exception as e:
                     log_message(f"Error reading user data: {e}")
                     response = "FAILED"
-                    continue
-                
-                
 
-
-                
-                
                 log_message(f"Compiled peer list: {response}")
 
             # Ping request
@@ -379,26 +412,34 @@ async def handle_client(client_socket):
 
             else:
                 log_message("Unknown request")
-                client_socket.send("UNKNOWN".encode('utf-8'))
+                client.socket.send("UNKNOWN".encode('utf-8'))
 
             if response:
                 log_message(f"Sending response: {response}")
-                client_socket.send(response.encode('utf-8'))
+                client.socket.send(response.encode('utf-8'))
 
     except socket.timeout:
         log_message("Client timeout, closing connection")
     except Exception as e:
         log_message(f"Error handling client: {e}")
-        clients.remove(client_socket)
+        try:
+            clients.remove(client)
+        except ValueError:
+            pass
     finally:
         # set the client status to offline
         try:
             with open(default_userdata_path, 'r') as json_file:
                 data = json.load(json_file)
 
-            for bID in data["bNETauth_data"]["clients"]:
-                if data["bNETauth_data"]["clients"][this_clientbID]["data"]["status"] == "online":
-                    data["bNETauth_data"]["clients"][this_clientbID]["data"]["status"] = "offline"
+            # Mark this client offline only if we know its bID and it exists in the data
+            if this_clientbID and this_clientbID in data.get("bNETauth_data", {}).get("clients", {}):
+                try:
+                    if data["bNETauth_data"]["clients"][this_clientbID]["data"].get("status") == "online":
+                        data["bNETauth_data"]["clients"][this_clientbID]["data"]["status"] = "offline"
+                except Exception:
+                    # Defensive: if structure is unexpected, don't crash finalizer
+                    pass
 
             with open(default_userdata_path, 'w') as json_file:
                 json.dump(data, json_file, indent=4)
@@ -406,9 +447,18 @@ async def handle_client(client_socket):
             log_message(f"Error updating client status: {e}")
 
         # Close the client socket
-        client_socket.send("CLOSED".encode('utf-8'))
-        client_socket.close()
-        clients.remove(client_socket)
+        try:
+            client.socket.send("CLOSED".encode('utf-8'))
+        except Exception:
+            pass
+        try:
+            client.socket.close()
+        except Exception:
+            pass
+        try:
+            clients.remove(client)
+        except ValueError:
+            pass
         log_message("Connection socket closed")
         status = "Listening..."
 

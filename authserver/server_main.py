@@ -6,6 +6,7 @@ import threading
 import curses
 import json
 import sys
+import errno
 
 
 def clear_term():
@@ -159,6 +160,7 @@ def console(stdscr):
         else:
             draw_console_ui(stdscr, "$", input_buffer)
 
+
         key = stdscr.getch()  # Get user input
         if key != -1:
             if key in (curses.KEY_BACKSPACE, 127, 8):  # Handle backspace
@@ -226,23 +228,67 @@ def handle_command(command):
     return True  # Continue running the loop
 
 
+
+
+use_localhost = False
+
 async def run_server():
     global status
     global server_running
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_ip = "127.0.0.1"
-    port = 30301
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    server.bind((server_ip, port))
-    server.listen(0)
+    if use_localhost:
+        server_ip = "127.0.0.1"
+    else:
+        server_ip = ""  # Bind to all interfaces
+
+    # Try to set SO_REUSEPORT if available (helps on some POSIX systems)
+    try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except Exception:
+        pass
+
+    # Attempt to bind; if the port is in use, try a small range of fallback ports
+    base_port = 30301
+    max_tries = 10
+    bound = False
+    for i in range(max_tries):
+        try_port = base_port + i
+        try:
+            server.bind((server_ip, try_port))
+            port = try_port
+            bound = True
+            break
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                log_message(f"Port {try_port} in use, trying next port...")
+                time.sleep(0.2)
+                continue
+            else:
+                log_message(f"Failed to bind socket: {e}")
+                raise
+
+    if not bound:
+        log_message(f"Unable to bind to any port in range {base_port}-{base_port+max_tries-1}")
+        raise SystemExit(1)
+
+    server.listen(1)
 
     server_running = True
-    log_message(f"Listening on {server_ip}:{port}")
+    log_message(f"Listening on {server.getsockname()}")
     status = "Listening..."
 
     while True:
-        os.system('title bNET Auth - Status: ' + status)
+        # Only try to set the console title on Windows. Calling external
+        # commands while curses controls the terminal can break remote
+        # terminals (PuTTY/SSH). Skip on POSIX systems.
+        try:
+            if os.name == 'nt':
+                os.system('title bNET Auth - Status: ' + status)
+        except Exception:
+            pass
 
         try:
             client_socket, client_address = \
@@ -265,6 +311,8 @@ async def run_server():
             # Handle client in a separate task
             asyncio.create_task(handle_client(client))
 
+        except socket.timeout:
+            pass
         except Exception as e:
             log_message(f"Error accepting connection: {e}")
 
@@ -468,17 +516,9 @@ def init():
     status = 'Initializing Console...'
 
     try:
-        # Show splash screen first
+        # Show splash screen first (runs briefly on main thread)
         status = 'Showing splash screen...'
         curses.wrapper(splash)
-
-        # Start console thread after splash
-        status = 'Starting console thread...'
-        console_thread = threading.Thread(
-            target=lambda: curses.wrapper(console))
-
-        console_thread.daemon = True
-        console_thread.start()
     except Exception as e:
         prelog(f"CRITICAL ERROR!; {e} failed at status: {status}")
         show_prelog_and_exit()
@@ -528,14 +568,40 @@ def init():
 
     status = 'Starting server session...'
 
-    try:
-        asyncio.run(run_server())
-    except Exception as e:
-        log_message(f'Failed to start server session; {e}')
-    finally:
-        log_message('Started server session')
+    # Run the asyncio server in a separate daemon thread so the main thread
+    # can safely run the curses UI. Running curses from a non-main thread
+    # on many platforms (and especially remote terminals) causes crashes.
+    def _server_runner():
+        # Use new_event_loop + run_until_complete for compatibility with
+        # Python versions that don't provide asyncio.run (pre-3.7).
+        loop = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(run_server())
+        except Exception as e:
+            log_message(f'Failed to start server session; {e}')
+        finally:
+            if loop is not None:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+    server_thread = threading.Thread(target=_server_runner, daemon=True)
+    server_thread.start()
+
+    log_message('Started server session')
 
     status = 'Initialization finished'
+
+    # Start the curses console on the main thread (blocking). This keeps
+    # curses in the main thread where it is supported by most terminals.
+    try:
+        status = 'Starting console thread...'
+        curses.wrapper(console)
+    except Exception as e:
+        log_message(f'Console failed: {e}')
 
 
 if __name__ == "__main__":

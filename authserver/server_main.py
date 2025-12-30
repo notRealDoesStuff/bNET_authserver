@@ -7,6 +7,7 @@ import curses
 import json
 import sys
 import errno
+import upnpy
 
 
 def clear_term():
@@ -42,6 +43,7 @@ try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_storage_path = os.path.join(script_dir, 'data')
     default_userdata_path = os.path.join(default_storage_path, 'users.json')
+    default_settings_path = os.path.join(default_storage_path, 'settings.json')
 except Exception as e:
     prelog(f"Error initializing paths: {e}")
     show_prelog_and_exit()
@@ -228,9 +230,60 @@ def handle_command(command):
     return True  # Continue running the loop
 
 
+# punch hole in NAT/firewall if possible
+def nat_punch_hole(port):
+    log_message("Attempting NAT hole punch via UPnP...")
+    try:
+        upnp = upnpy.UPnP() # Create UPnP object
+        devices = upnp.discover(delay=2) # Discover UPnP devices on the network
+
+        if not devices:
+            log_message("No UPnP devices found, skipping NAT punch")
+            return
+
+        device = upnp.get_igd() # Get the Internet Gateway Device
+        
+        if device is None:
+            log_message("No IGD (Internet Gateway Device) found, skipping NAT punch")
+            return
+
+        # Try to get the WANIPConnection service first, fall back to WANPPPConnection
+        service = None
+        try:
+            service = device.get_service('urn:schemas-upnp-org:service:WANIPConnection:1')
+        except Exception:
+            try:
+                service = device.get_service('urn:schemas-upnp-org:service:WANPPPConnection:1')
+            except Exception:
+                log_message("Could not find WANIPConnection or WANPPPConnection service")
+                return
+        
+        if service is None:
+            log_message("No WAN service found on IGD, skipping NAT punch")
+            return
+        
+        service.AddPortMapping(
+            NewRemoteHost='',
+            NewExternalPort=port,
+            NewProtocol='TCP',
+            NewInternalPort=port,
+            NewInternalClient=socket.gethostbyname(socket.gethostname()),
+            NewEnabled='1',
+            NewPortMappingDescription='bNET Auth Server',
+            NewLeaseDuration='0'
+        )
+        
+        log_message(f"UPnP port mapping successful for port {port}")
+    except ImportError:
+        log_message("UPnP library not available, skipping NAT punch")
+    except Exception as e:
+        log_message(f"NAT punch hole failed: {e}")
+        log_message("Continuing without NAT traversal...")
 
 
 use_localhost = False
+attempt_nat_traversal = True
+default_port = 0  # Default port, will be overridden by settings
 
 async def run_server():
     global status
@@ -250,8 +303,13 @@ async def run_server():
     except Exception:
         pass
 
+    base_port = default_port
+
+    # Try to punch a hole in the NAT/firewall if enabled
+    if attempt_nat_traversal:
+        nat_punch_hole(base_port)
+
     # Attempt to bind; if the port is in use, try a small range of fallback ports
-    base_port = 30301
     max_tries = 10
     bound = False
     for i in range(max_tries):
@@ -565,6 +623,41 @@ def init():
             log_message('Data json found')
     except Exception as e:
         log_message(f'Error while searching for Data json; {e}')
+
+    status = "Searching for settings json..."
+
+    try:
+        if not os.path.exists(default_settings_path):
+            log_message("Settings json not found")
+
+            default_settings = {
+                "server": {
+                    "default_port": 30301,
+                }
+            }
+
+            try:
+                with open(default_settings_path, 'w') as json_file:
+                    json.dump(default_settings, json_file, indent=4)
+            except Exception as e:
+                log_message(f'Unable to create Settings json; {e}')
+            finally:
+                log_message('Settings json created')
+        else:
+            log_message('Settings json found')
+            # Load settings
+        
+        if os.path.exists(default_settings_path):
+            try:
+                with open(default_settings_path, 'r') as json_file:
+                    settings_data = json.load(json_file)
+                    global default_port
+                    default_port = settings_data["server"].get("default_port")
+            except Exception as e:
+                log_message(f'Unable to load Settings json; {e}')
+
+    except Exception as e:
+        log_message(f'Error while searching for Settings json; {e}')
 
     status = 'Starting server session...'
 

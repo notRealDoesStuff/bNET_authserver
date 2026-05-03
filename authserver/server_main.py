@@ -1,3 +1,34 @@
+
+# =============================
+# bNET Auth Server: Direct Exposure State Machine
+# -------------------------------------------------
+# This server exposes itself to the public internet using:
+#   1. UPnP port mapping (if enabled)
+#   2. STUN public endpoint discovery (if enabled)
+#   3. Manual port forwarding (fallback)
+#
+# Manual Port-Forward Deployment Mode:
+#   - Disable UPnP and STUN in data/settings.json or via environment variables.
+#   - Manually forward the chosen port on your router to the server's LAN IP.
+#   - The server will bind to the configured port and host, but will not attempt NAT traversal.
+#   - See MANUAL_PORT_FORWARD_DEPLOYMENT.md for full instructions.
+#
+# UDP Auth Packet Structure (Direct Only):
+#   - Stateless, challenge-response protocol over UDP
+#   - No relay/tunnel/edge fields; all packets are direct
+#   - See UDP_AUTH_PACKET_SPEC.md for field definitions and encoding
+#
+# The state machine is:
+#   INIT -> UPNP -> (success/fail) -> STUN -> (success/fail) -> MANUAL
+#   If UPnP or STUN succeed, server is READY (publicly reachable).
+#   If both fail, server is PARTIAL (local only, manual intervention required).
+#
+# The GET_NETWORK_STATUS response reports:
+#   NETWORK_STATUS::BOUND::<bound_port>::PUBLIC::<public_ip:public_port>::UPNP::<ON|OFF>
+#
+# See DIRECT_EXPOSURE_STATE_MACHINE.md, MANUAL_PORT_FORWARD_DEPLOYMENT.md, and UDP_AUTH_PACKET_SPEC.md for full details.
+# =============================
+
 import os
 import socket
 import time
@@ -8,8 +39,133 @@ import json
 import sys
 import errno
 import upnpy
+import base64
+import secrets
+from collections import deque
 from datetime import datetime, timezone
 import bnet_stun
+def udp_auth_server(listen_port):
+    """
+    Stateless UDP authentication server for direct client connections.
+    Handles HELLO, CHALLENGE, RESPONSE, AUTH_RESULT packets as per UDP_AUTH_PACKET_SPEC.md.
+    Runs in its own daemon thread — must not be used as an asyncio task.
+    """
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        udp_sock.bind((server_config.get("bind_host", "0.0.0.0"), listen_port))
+    except Exception as e:
+        log_message(f"UDP bind failed: {e}")
+        return
+
+    log_message(f"UDP auth server listening on port {listen_port}")
+
+    # In-memory challenge state: { (client_addr, client_id): {nonce, salt, kdf, kdf_params, ts} }
+    challenges = {}
+    CHALLENGE_TIMEOUT = 30  # seconds
+
+    while True:
+        try:
+            udp_sock.settimeout(1.0)
+            try:
+                data, addr = udp_sock.recvfrom(4096)
+            except socket.timeout:
+                # Periodically clean up expired challenges
+                now = time.time()
+                expired = [k for k, v in challenges.items() if now - v["ts"] > CHALLENGE_TIMEOUT]
+                for k in expired:
+                    challenges.pop(k, None)
+                continue
+
+            try:
+                pkt = json.loads(data.decode("utf-8"))
+            except Exception:
+                log_message(f"UDP: Invalid JSON from {addr}")
+                continue
+
+            magic = pkt.get("magic")
+            ptype = pkt.get("type")
+            if magic != "bNET2":
+                continue
+
+            if ptype == "HELLO":
+                client_id = pkt.get("client_id")
+                client_nonce = pkt.get("nonce")
+                version = pkt.get("version")
+                if not client_id or not client_nonce:
+                    continue
+                # Generate challenge
+                server_nonce = base64.b64encode(secrets.token_bytes(16)).decode()
+                salt = base64.b64encode(secrets.token_bytes(16)).decode()
+                kdf = "scrypt"
+                kdf_params = {"N": 16384, "r": 8, "p": 1}
+                challenges[(addr, client_id)] = {
+                    "server_nonce": server_nonce,
+                    "salt": salt,
+                    "kdf": kdf,
+                    "kdf_params": kdf_params,
+                    "ts": time.time(),
+                }
+                resp = {
+                    "magic": "bNET2",
+                    "type": "CHALLENGE",
+                    "server_nonce": server_nonce,
+                    "salt": salt,
+                    "kdf": kdf,
+                    "kdf_params": kdf_params,
+                }
+                udp_sock.sendto(json.dumps(resp).encode("utf-8"), addr)
+                log_message(f"UDP: Sent CHALLENGE to {addr} for {client_id}")
+
+            elif ptype == "RESPONSE":
+                client_id = pkt.get("client_id")
+                response = pkt.get("response")
+                key = (addr, client_id)
+                ch = challenges.get(key)
+                if not ch:
+                    continue
+                # Load user data and verify
+                data = load_user_data()
+                entry = data.get("bNETauth_data", {}).get("clients", {}).get(client_id)
+                if not entry:
+                    result = "ERROR_NOUSER"
+                else:
+                    password = entry.get("password")
+                    # Derive key using scrypt
+                    try:
+                        import hashlib
+                        salt_bytes = base64.b64decode(ch["salt"])
+                        kdf_params = ch["kdf_params"]
+                        key_bytes = hashlib.scrypt(password.encode(), salt=salt_bytes, n=kdf_params["N"], r=kdf_params["r"], p=kdf_params["p"], dklen=32)
+                        # Compute HMAC(server_nonce, key)
+                        import hmac
+                        server_nonce_bytes = base64.b64decode(ch["server_nonce"])
+                        expected = hmac.new(key_bytes, server_nonce_bytes, digestmod="sha256").digest()
+                        expected_b64 = base64.b64encode(expected).decode()
+                        if hmac.compare_digest(expected_b64, response):
+                            result = "OK"
+                        else:
+                            result = "ERROR_BADPASS"
+                    except Exception as e:
+                        log_message(f"UDP: Auth error: {e}")
+                        result = "ERROR_INTERNAL"
+                # Send AUTH_RESULT
+                pub_ip = auth_public_endpoint["public_ip"] if auth_public_endpoint else "UNKNOWN"
+                pub_port = auth_public_endpoint["public_port"] if auth_public_endpoint else 0
+                resp = {
+                    "magic": "bNET2",
+                    "type": "AUTH_RESULT",
+                    "result": result,
+                    "public_ip": pub_ip,
+                    "public_port": pub_port,
+                }
+                udp_sock.sendto(json.dumps(resp).encode("utf-8"), addr)
+                log_message(f"UDP: Sent AUTH_RESULT {result} to {addr} for {client_id}")
+                challenges.pop(key, None)
+
+            # Ignore other packet types for now
+        except Exception as e:
+            log_message(f"UDP server error: {e}")
 
 
 def clear_term():
@@ -64,7 +220,9 @@ except Exception as e:
 
 
 total_logged = 0
-last_logmessages = []
+last_logmessages = deque(maxlen=500)
+log_messages_lock = threading.Lock()
+server_started_ts = time.time()
 
 clients = []
 active_sessions = {}
@@ -76,9 +234,56 @@ network_state = {
     "last_stun_refresh_ts": 0.0,
 }
 
+# Relay sessions: token → {from_bid, to_bid, from_sock, to_sock, created_ts}
+# A relay session is created when a peer requests a relay to another peer.
+# Both peers open a fresh TCP connection to auth and JOIN_RELAY; auth then
+# pipes bytes between the two sockets so CGNAT / symmetric-NAT clients can
+# communicate without any direct P2P path.
+relay_sessions = {}
+relay_sessions_lock = threading.Lock()
+RELAY_SESSION_TIMEOUT_SEC = 120
+
+
+def _relay_pipe(src_sock, dst_sock, label):
+    """Blocking pipe: forward bytes from src_sock to dst_sock until either closes."""
+    try:
+        while True:
+            data = src_sock.recv(4096)
+            if not data:
+                break
+            dst_sock.sendall(data)
+    except Exception:
+        pass
+    finally:
+        for s in (src_sock, dst_sock):
+            try:
+                s.close()
+            except Exception:
+                pass
+        log_message(f"[relay] pipe {label} closed")
+
+
+def _cleanup_stale_relay_sessions():
+    now = time.time()
+    with relay_sessions_lock:
+        stale = [
+            tok for tok, rs in relay_sessions.items()
+            if now - rs.get("created_ts", 0) > RELAY_SESSION_TIMEOUT_SEC
+        ]
+        for tok in stale:
+            for key in ("from_sock", "to_sock"):
+                s = relay_sessions[tok].get(key)
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            relay_sessions.pop(tok, None)
+
 
 server_config = {
     "default_port": 30301,
+    "local_mode": False,
     "bind_host": "0.0.0.0",
     "listen_backlog": 128,
     "accept_timeout_sec": 1.0,
@@ -128,6 +333,7 @@ def env_override_config():
     # Environment overrides simplify deployment in containers and cloud hosts.
     env_map = {
         "BNET_AUTH_PORT": ("default_port", int),
+        "BNET_AUTH_LOCAL_MODE": ("local_mode", bool),
         "BNET_AUTH_BIND_HOST": ("bind_host", str),
         "BNET_AUTH_BACKLOG": ("listen_backlog", int),
         "BNET_AUTH_ACCEPT_TIMEOUT": ("accept_timeout_sec", float),
@@ -162,6 +368,20 @@ def env_override_config():
         parsed = _parse_csv(stun_env)
         if parsed:
             server_config["stun_servers"] = parsed
+
+
+def apply_local_mode_overrides():
+    if not _parse_bool(server_config.get("local_mode"), False):
+        return
+
+    server_config["bind_host"] = "127.0.0.1"
+    server_config["auto_network_bootstrap"] = False
+    server_config["enable_upnp"] = False
+    server_config["enable_stun"] = False
+
+
+def get_network_mode_label():
+    return "LOCAL" if _parse_bool(server_config.get("local_mode"), False) else "PUBLIC"
 
 
 def detect_local_lan_ip():
@@ -448,6 +668,10 @@ class Client:
             self.address = ("unknown", 0)
         self.conn_port = None
         self.bID = None
+        # Set to True when this connection transitions to relay-pipe mode.
+        # The finally block in handle_client will skip the normal socket close
+        # so the relay pipe threads own the socket lifetime.
+        self.relay_mode = False
 
     def __str__(self):
         return f"Client({self.address[0]}:{self.address[1]})"
@@ -463,10 +687,243 @@ def log_message(message):
     if len(safe_message) > max_len:
         safe_message = safe_message[:max_len - 3] + "..."
 
-    last_logmessages.append(f'[{total_logged}] {safe_message}')
-    total_logged += 1
-    if len(last_logmessages) > 10:  # Keep only the last 10 messages
-        last_logmessages.pop(0)
+    with log_messages_lock:
+        last_logmessages.append(f'[{total_logged}] {safe_message}')
+        total_logged += 1
+
+
+def clear_log_messages():
+    global total_logged
+    with log_messages_lock:
+        last_logmessages.clear()
+        last_logmessages.append(f'[{total_logged}] Console log cleared')
+        total_logged += 1
+
+
+def get_log_snapshot():
+    with log_messages_lock:
+        return list(last_logmessages)
+
+
+def build_console_state():
+    return {
+        "input_buffer": "",
+        "history": [],
+        "history_index": None,
+        "current_tab": "overview",
+        "log_top_index": 0,
+        "connection_top_index": 0,
+        "follow_logs": True,
+        "throbber_index": 0,
+        "last_throbber_update": time.time(),
+        "last_cursor_flash": time.time(),
+        "cursor_visible": True,
+    }
+
+
+def _trim_text(value, width):
+    text = str(value or "")
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[:width - 3] + "..."
+
+
+def safe_addstr(stdscr, y, x, text, width=None):
+    try:
+        height, screen_width = stdscr.getmaxyx()
+    except Exception:
+        height, screen_width = 24, 80
+
+    if y < 0 or y >= height or x >= screen_width:
+        return
+
+    available = max(0, screen_width - x)
+    if width is not None:
+        available = min(available, width)
+    if available <= 0:
+        return
+
+    rendered = _trim_text(text, available)
+    try:
+        stdscr.addstr(y, x, rendered)
+    except curses.error:
+        pass
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02}:{minutes:02}:{secs:02}"
+    return f"{minutes:02}:{secs:02}"
+
+
+def get_connectable_label():
+    if auth_public_endpoint:
+        return f"{auth_public_endpoint['public_ip']}:{auth_public_endpoint['public_port']}"
+
+    bind_host = str(server_config.get("bind_host", "0.0.0.0")).strip() or "0.0.0.0"
+    display_host = "127.0.0.1" if bind_host in {"", "0.0.0.0"} else bind_host
+    bound_port = network_state.get("bound_port") or server_config.get("default_port") or "?"
+    return f"{display_host}:{bound_port} (local/fallback)"
+
+
+def build_network_summary_text():
+    public = "UNKNOWN"
+    if auth_public_endpoint:
+        public = f"{auth_public_endpoint['public_ip']}:{auth_public_endpoint['public_port']}"
+
+    mode = get_network_mode_label()
+    bound_port = network_state.get("bound_port") or server_config.get("default_port") or "UNKNOWN"
+    upnp = "ON" if network_state.get("upnp_active") else "OFF"
+    last_stun = network_state.get("last_stun_refresh_ts", 0.0)
+    if last_stun:
+        stun_age = format_duration(time.time() - last_stun) + " ago"
+    else:
+        stun_age = "never"
+
+    return f"mode={mode} bound={bound_port} public={public} upnp={upnp} stun_refresh={stun_age}"
+
+
+def build_status_panel_lines():
+    uptime = format_duration(time.time() - server_started_ts)
+    public = "UNKNOWN"
+    if auth_public_endpoint:
+        public = f"{auth_public_endpoint['public_ip']}:{auth_public_endpoint['public_port']}"
+
+    last_stun = network_state.get("last_stun_refresh_ts", 0.0)
+    stun_age = "never" if not last_stun else format_duration(time.time() - last_stun) + " ago"
+
+    return [
+        "Status",
+        f"Runtime: {'up' if server_running else 'down'}",
+        f"State: {status}",
+        f"Mode: {get_network_mode_label().lower()}",
+        f"Uptime: {uptime}",
+        f"Clients: {len(clients)}",
+        f"Sessions: {len(active_sessions)}",
+        f"Bound: {network_state.get('bound_port') or server_config.get('default_port') or '?'}",
+        f"Public: {public}",
+        f"UPnP: {'on' if network_state.get('upnp_active') else 'off'}",
+        f"STUN: {stun_age}",
+        f"Logs: {len(get_log_snapshot())}/{last_logmessages.maxlen}",
+    ]
+
+
+COMMAND_HELP = {
+    "help": "Show available console commands",
+    "status": "Print the current server status line",
+    "network": "Print the current direct exposure summary",
+    "sessions": "Print active session summaries",
+    "clients": "Print connected client socket details",
+    "test-listpeers": "Run the existing peer list diagnostic",
+    "clear": "Clear the in-memory console log buffer",
+    "exit": "Stop the console and exit the auth server",
+}
+
+CONSOLE_TABS = ["overview", "logs", "connections"]
+
+
+def rotate_tab(current_tab, direction):
+    try:
+        current_index = CONSOLE_TABS.index(current_tab)
+    except ValueError:
+        current_index = 0
+    return CONSOLE_TABS[(current_index + direction) % len(CONSOLE_TABS)]
+
+
+def build_tab_line(current_tab):
+    labels = []
+    for tab in CONSOLE_TABS:
+        label = tab.upper()
+        if tab == current_tab:
+            labels.append(f"[{label}]")
+        else:
+            labels.append(f" {label} ")
+    return "Tabs: " + " | ".join(labels)
+
+
+def get_client_snapshot():
+    rows = []
+    for client in list(clients):
+        try:
+            addr = client.socket.getpeername()
+        except Exception:
+            addr = getattr(client, "address", ("unknown", 0))
+        rows.append({
+            "remote": f"{addr[0]}:{addr[1]}",
+            "bid": getattr(client, "bID", None) or "-",
+            "conn_port": str(getattr(client, "conn_port", None) or "-"),
+        })
+    rows.sort(key=lambda row: (row["bid"], row["remote"]))
+    return rows
+
+
+def build_connections_lines():
+    lines = [
+        f"TCP clients: {len(clients)} | Active sessions: {len(active_sessions)}",
+        "",
+        "TCP client sockets",
+    ]
+
+    client_rows = get_client_snapshot()
+    if not client_rows:
+        lines.append("  none")
+    else:
+        lines.append("  remote                  bID                              listen")
+        for row in client_rows:
+            lines.append(
+                f"  {_trim_text(row['remote'], 22):22} {_trim_text(row['bid'], 32):32} {_trim_text(row['conn_port'], 6):6}"
+            )
+
+    lines.extend(["", "Auth sessions"])
+    if not active_sessions:
+        lines.append("  none")
+    else:
+        lines.append("  bID                              online public                  private                 last_seen")
+        for bid, session in sorted(active_sessions.items()):
+            public = f"{session.get('public_ip') or '?'}:{session.get('public_port') or '?'}"
+            private = f"{session.get('private_ip') or '?'}:{session.get('private_port') or '?'}"
+            last_seen_iso = session.get("last_seen_iso") or "-"
+            lines.append(
+                "  "
+                + f"{_trim_text(bid, 32):32} "
+                + f"{('yes' if session.get('is_online') else 'no'):6} "
+                + f"{_trim_text(public, 22):22} "
+                + f"{_trim_text(private, 22):22} "
+                + f"{_trim_text(last_seen_iso, 19):19}"
+            )
+
+    return lines
+
+
+def get_tab_lines(console_state):
+    current_tab = console_state.get("current_tab", "overview")
+    if current_tab == "connections":
+        return "Connections", build_connections_lines(), "connection_top_index"
+    if current_tab == "logs":
+        logs = [f"# {entry}" for entry in get_log_snapshot()]
+        return f"Logs {len(logs)}/{last_logmessages.maxlen}", logs or ["# no log messages yet"], "log_top_index"
+
+    logs = get_log_snapshot()
+    recent_logs = [f"# {entry}" for entry in logs[-200:]] or ["# no log messages yet"]
+    return f"Overview | recent logs {len(recent_logs)}", recent_logs, "log_top_index"
+
+
+def compute_view_window(console_state, row_count, visible_rows, index_key):
+    max_top_index = max(0, row_count - visible_rows)
+    if index_key == "log_top_index" and console_state.get("follow_logs", True):
+        top_index = max_top_index
+        console_state[index_key] = top_index
+    else:
+        top_index = min(max(console_state.get(index_key, 0), 0), max_top_index)
+        console_state[index_key] = top_index
+    return top_index, max_top_index
 
 
 def splash(stdscr):
@@ -491,81 +948,187 @@ def splash(stdscr):
     time.sleep(1)
 
 
-def draw_console_ui(stdscr, throbber_char, input_buffer):
-    if auth_public_endpoint:
-        connectable = f"{auth_public_endpoint['public_ip']}:{auth_public_endpoint['public_port']}"
-    else:
-        bind_host = str(server_config.get("bind_host", "0.0.0.0")).strip() or "0.0.0.0"
-        display_host = "127.0.0.1" if bind_host in {"", "0.0.0.0"} else bind_host
-        bound_port = network_state.get("bound_port") or server_config.get("default_port") or "?"
-        connectable = f"{display_host}:{bound_port} (local/fallback)"
+def draw_console_ui(stdscr, throbber_char, console_state):
+    height, width = stdscr.getmaxyx()
+    is_split_layout = width >= 120 and height >= 18
 
-    stdscr.clear()
-    stdscr.addstr(0, 0, f'####### bNET auth v{version} ########')
-    stdscr.addstr(1, 0, f'##### Protocol: {protocol} v{protocol_ver} #####')
-    stdscr.addstr(2, 0, f'#  {len(clients)} Clients connected')
-    runmarker = 'Server is running...' if server_running else \
-        'Server is not running...'
-    stdscr.addstr(3, 0, f'#  {runmarker} {throbber_char}')
-    stdscr.addstr(4, 0, f'#  Connectable at: {connectable}')
-    stdscr.addstr(5, 0, '')
-    stdscr.addstr(6, 0, f'Status: {status}')
-    stdscr.addstr(7, 0, '### log ###')
-    for idx, message in enumerate(last_logmessages):
-        stdscr.addstr(8 + idx, 0, f"# {message}")
-    stdscr.addstr(9 + len(last_logmessages), 0, 'Input: ')
-    stdscr.addstr(9 + len(last_logmessages), 7, input_buffer)
+    stdscr.erase()
+
+    safe_addstr(stdscr, 0, 0, f"####### bNET auth v{version} ########")
+    safe_addstr(stdscr, 1, 0, f"Protocol: {protocol} v{protocol_ver} | Software: {software_ver}")
+    runmarker = "running" if server_running else "stopped"
+    safe_addstr(stdscr, 2, 0, f"Server: {runmarker} {throbber_char} | Clients: {len(clients)} | Sessions: {len(active_sessions)}")
+    safe_addstr(stdscr, 3, 0, f"Connectable: {get_connectable_label()}")
+    safe_addstr(stdscr, 4, 0, f"Status: {status}")
+    safe_addstr(stdscr, 5, 0, build_tab_line(console_state.get("current_tab", "overview")), width)
+
+    footer_hint_y = max(6, height - 2)
+    footer_input_y = max(7, height - 1)
+    body_top = 7
+    body_bottom = max(body_top, footer_hint_y - 1)
+    body_height = max(1, body_bottom - body_top)
+
+    status_width = 34 if is_split_layout else 0
+    log_width = width if not is_split_layout else max(20, width - status_width - 1)
+    log_x = 0
+    status_x = log_width + 1
+
+    content_title, content_lines, index_key = get_tab_lines(console_state)
+    visible_rows = max(1, body_height - 1)
+    top_index, max_top_index = compute_view_window(console_state, len(content_lines), visible_rows, index_key)
+
+    if index_key == "log_top_index" and not console_state.get("follow_logs", True):
+        content_title += f" | scroll {top_index + 1}-{min(len(content_lines), top_index + visible_rows)}"
+    elif index_key != "log_top_index" and len(content_lines) > visible_rows:
+        content_title += f" | rows {top_index + 1}-{min(len(content_lines), top_index + visible_rows)}"
+
+    safe_addstr(stdscr, body_top, log_x, content_title, log_width)
+    visible_lines = content_lines[top_index:top_index + visible_rows]
+    for idx, line in enumerate(visible_lines):
+        safe_addstr(stdscr, body_top + 1 + idx, log_x, line, log_width)
+
+    if is_split_layout:
+        panel_lines = build_status_panel_lines()
+        for idx, line in enumerate(panel_lines[:body_height]):
+            safe_addstr(stdscr, body_top + idx, status_x, line, status_width)
+
+    hints = "Keys: Tab/Shift+Tab or Left/Right switch tabs | Up/Down history | PgUp/PgDn scroll | End live tail | Ctrl+C exit"
+    safe_addstr(stdscr, footer_hint_y, 0, hints, width)
+    prompt = "Input: "
+    available_input_width = max(0, width - len(prompt))
+    rendered_input = _trim_text(console_state["input_buffer"], available_input_width)
+    safe_addstr(stdscr, footer_input_y, 0, prompt, width)
+    safe_addstr(stdscr, footer_input_y, len(prompt), rendered_input, available_input_width)
+
+    cursor_x = min(width - 1, len(prompt) + len(rendered_input)) if width > 0 else 0
+    try:
+        stdscr.move(footer_input_y, cursor_x)
+    except curses.error:
+        pass
     stdscr.refresh()
 
 
 def console(stdscr):
     global status
 
+    console_state = build_console_state()
+
     curses.curs_set(1)  # Show the cursor
     stdscr.nodelay(1)   # Don't block on input
+    stdscr.keypad(True)
     stdscr.clear()
-
-    input_buffer = ""  # Buffer to hold user input
-    throbber_index = 0
-    last_throbber_update = time.time()  # Track the last update time
-    last_cursor_flash = time.time()
-    throbber_char = None
 
     while True:
         current_time = time.time()
 
-        # Update throbber every 100 milliseconds
-        if current_time - last_throbber_update >= 0.35:
-            throbber_char = throbberchars2[throbber_index % len(throbberchars2)]
-            last_throbber_update = current_time
-            throbber_index += 1
-
-        # Flash the cursor every second
-        if current_time - last_cursor_flash >= 1:
-            curses.curs_set(1 if curses.curs_set(0) == 0 else 0)
-            last_cursor_flash = current_time
-
-        if throbber_char:
-            draw_console_ui(stdscr, throbber_char, input_buffer)
+        if current_time - console_state["last_throbber_update"] >= 0.35:
+            throbber_char = throbberchars2[console_state["throbber_index"] % len(throbberchars2)]
+            console_state["last_throbber_update"] = current_time
+            console_state["throbber_index"] += 1
         else:
-            draw_console_ui(stdscr, "$", input_buffer)
+            throbber_char = throbberchars2[(console_state["throbber_index"] - 1) % len(throbberchars2)]
 
+        if current_time - console_state["last_cursor_flash"] >= 1:
+            console_state["cursor_visible"] = not console_state["cursor_visible"]
+            try:
+                curses.curs_set(1 if console_state["cursor_visible"] else 0)
+            except curses.error:
+                pass
+            console_state["last_cursor_flash"] = current_time
+
+        draw_console_ui(stdscr, throbber_char or "$", console_state)
 
         key = stdscr.getch()  # Get user input
         if key != -1:
-            if key in (curses.KEY_BACKSPACE, 127, 8):  # Handle backspace
-                input_buffer = input_buffer[:-1]
-                curses.curs_set(1)
-            elif key == 10:  # Enter key
-                # Process the input (e.g., log it, execute a command, etc.)
-                handle_command(input_buffer)
-                input_buffer = ""  # Clear the input buffer after processing
-            elif 32 <= key <= 126:  # Printable characters
-                input_buffer += chr(key)  # Add character to input buffer
-                curses.curs_set(1)
+            current_tab = console_state.get("current_tab", "overview")
+            if current_tab == "connections":
+                row_count = len(build_connections_lines())
+                active_index_key = "connection_top_index"
+            elif current_tab == "logs":
+                row_count = len(get_log_snapshot())
+                active_index_key = "log_top_index"
+            else:
+                row_count = min(200, len(get_log_snapshot()))
+                active_index_key = "log_top_index"
 
-        # put the cursor at the end of the input line
-        stdscr.move(9 + len(last_logmessages), len(input_buffer))
+            height, _ = stdscr.getmaxyx()
+            max_log_rows = max(1, max(6, height - 2) - 8)
+            max_top_index = max(0, row_count - max_log_rows)
+
+            if key in (curses.KEY_BACKSPACE, 127, 8):  # Handle backspace
+                console_state["input_buffer"] = console_state["input_buffer"][:-1]
+                console_state["history_index"] = None
+                try:
+                    curses.curs_set(1)
+                except curses.error:
+                    pass
+            elif key in (9, curses.KEY_RIGHT):
+                console_state["current_tab"] = rotate_tab(console_state.get("current_tab", "overview"), 1)
+                console_state["follow_logs"] = console_state["current_tab"] != "connections"
+            elif key in (curses.KEY_BTAB, curses.KEY_LEFT):
+                console_state["current_tab"] = rotate_tab(console_state.get("current_tab", "overview"), -1)
+                console_state["follow_logs"] = console_state["current_tab"] != "connections"
+            elif key == curses.KEY_UP:
+                history = console_state["history"]
+                if history:
+                    if console_state["history_index"] is None:
+                        console_state["history_index"] = len(history) - 1
+                    else:
+                        console_state["history_index"] = max(0, console_state["history_index"] - 1)
+                    console_state["input_buffer"] = history[console_state["history_index"]]
+            elif key == curses.KEY_DOWN:
+                history = console_state["history"]
+                if history:
+                    if console_state["history_index"] is None:
+                        continue
+                    console_state["history_index"] += 1
+                    if console_state["history_index"] >= len(history):
+                        console_state["history_index"] = None
+                        console_state["input_buffer"] = ""
+                    else:
+                        console_state["input_buffer"] = history[console_state["history_index"]]
+            elif key == curses.KEY_PPAGE:
+                current_top = max_top_index if (active_index_key == "log_top_index" and console_state["follow_logs"]) else console_state[active_index_key]
+                if active_index_key == "log_top_index":
+                    console_state["follow_logs"] = False
+                console_state[active_index_key] = max(0, current_top - max(3, max_log_rows - 2))
+            elif key == curses.KEY_NPAGE:
+                current_top = max_top_index if (active_index_key == "log_top_index" and console_state["follow_logs"]) else console_state[active_index_key]
+                console_state[active_index_key] = min(max_top_index, current_top + max(3, max_log_rows - 2))
+                if active_index_key == "log_top_index":
+                    console_state["follow_logs"] = console_state[active_index_key] >= max_top_index
+            elif key == curses.KEY_HOME:
+                if active_index_key == "log_top_index":
+                    console_state["follow_logs"] = False
+                console_state[active_index_key] = 0
+            elif key == curses.KEY_END:
+                console_state[active_index_key] = max_top_index
+                if active_index_key == "log_top_index":
+                    console_state["follow_logs"] = True
+            elif key == 3:
+                log_message("Received Ctrl+C, shutting down console")
+                status = "Exiting..."
+                return
+            elif key == 10:  # Enter key
+                command = console_state["input_buffer"].strip()
+                if command:
+                    if not console_state["history"] or console_state["history"][-1] != command:
+                        console_state["history"].append(command)
+                        if len(console_state["history"]) > 50:
+                            console_state["history"] = console_state["history"][-50:]
+                console_state["history_index"] = None
+                should_continue = handle_command(command)
+                console_state["input_buffer"] = ""
+                console_state["follow_logs"] = True
+                if not should_continue:
+                    return
+            elif 32 <= key <= 126:  # Printable characters
+                console_state["input_buffer"] += chr(key)
+                console_state["history_index"] = None
+                try:
+                    curses.curs_set(1)
+                except curses.error:
+                    pass
 
         time.sleep(0.01)  # Throttle the loop to avoid high CPU usage
 
@@ -573,15 +1136,39 @@ def console(stdscr):
 def handle_command(command):
     global status
 
-    if command.lower() == "help":
-        log_message("Available commands: help, status, exit, test-listpeers")
-    elif command.lower() == "status":
+    command = str(command or "").strip()
+    if not command:
+        return True
+
+    lowered = command.lower()
+
+    if lowered == "help":
+        log_message("Available commands:")
+        for name, description in COMMAND_HELP.items():
+            log_message(f" - {name}: {description}")
+    elif lowered == "status":
         log_message(f"Current status: {status}")
-    elif command.lower() == "exit":
+    elif lowered == "network":
+        log_message(f"Network: {build_network_summary_text()}")
+    elif lowered == "sessions":
+        if not active_sessions:
+            log_message("Active sessions: none")
+        else:
+            log_message(f"Active sessions: {len(active_sessions)}")
+            for bID, session in sorted(active_sessions.items()):
+                summary = (
+                    f" - {bID} online={session.get('is_online', False)} "
+                    f"pub={session.get('public_ip')}:{session.get('public_port')} "
+                    f"priv={session.get('private_ip')}:{session.get('private_port')}"
+                )
+                log_message(summary)
+    elif lowered == "clear":
+        clear_log_messages()
+    elif lowered == "exit":
         log_message("killing server...")
         status = "Exiting..."
-        sys.exit(0)
-    elif command.lower() == "test-listpeers":
+        return False
+    elif lowered == "test-listpeers":
 
         peers = []
 
@@ -604,7 +1191,7 @@ def handle_command(command):
             log_message(f"Test LISTPEERS result: {response}")
         except Exception as e:
             log_message(f"Error reading user data: {e}")
-    elif command.lower() == "clients":
+    elif lowered == "clients":
         log_message(f"Connected clients: {len(clients)}")
         for c in clients:
             try:
@@ -614,6 +1201,7 @@ def handle_command(command):
                 log_message(f" - <disconnected client> conn_port: {getattr(c,'conn_port', None)} bID: {getattr(c,'bID', None)}")
     else:
         log_message(f"Unknown command: {command}")
+        log_message("Type 'help' to list console commands")
 
     return True  # Continue running the loop
 
@@ -680,9 +1268,15 @@ def apply_upnp_mapping(listen_port):
 
 
 def bootstrap_network_access(listen_port):
+    global auth_public_endpoint
     network_state["bound_port"] = int(listen_port)
     network_state["upnp_active"] = False
     network_state["upnp_external_ip"] = None
+    auth_public_endpoint = None
+
+    if _parse_bool(server_config.get("local_mode"), False):
+        log_message("Local mode enabled: skipping UPnP and STUN bootstrap")
+        return
 
     if _parse_bool(server_config.get("enable_upnp"), True):
         apply_upnp_mapping(listen_port)
@@ -698,6 +1292,9 @@ def bootstrap_network_access(listen_port):
 
 
 def periodic_network_maintenance(listen_port):
+    if _parse_bool(server_config.get("local_mode"), False):
+        return
+
     refresh_interval = max(30, _parse_int(server_config.get("network_refresh_sec"), 300))
     last_upnp_ts = 0.0
     while True:
@@ -725,8 +1322,6 @@ def periodic_network_maintenance(listen_port):
 
         time.sleep(5)
 
-
-use_localhost = False
 default_port = 0  # Default port, will be overridden by settings
 
 async def run_server():
@@ -741,7 +1336,7 @@ async def run_server():
         except Exception:
             pass
 
-    if use_localhost:
+    if _parse_bool(server_config.get("local_mode"), False):
         server_ip = "127.0.0.1"
     else:
         configured_host = str(server_config.get("bind_host", "0.0.0.0")).strip()
@@ -768,27 +1363,43 @@ async def run_server():
     server.listen(backlog)
     server.settimeout(float(server_config.get("accept_timeout_sec", 1.0)))
 
+
     if _parse_bool(server_config.get("auto_network_bootstrap"), True):
         bootstrap_network_access(port)
-        maint = threading.Thread(target=periodic_network_maintenance, args=(port,), daemon=True)
-        maint.start()
+        if not _parse_bool(server_config.get("local_mode"), False):
+            maint = threading.Thread(target=periodic_network_maintenance, args=(port,), daemon=True)
+            maint.start()
     else:
         # Explicit fallback path when bootstrap automation is disabled.
-        if _parse_bool(server_config.get("enable_upnp"), True):
+        network_state["bound_port"] = int(port)
+        network_state["upnp_active"] = False
+        network_state["upnp_external_ip"] = None
+        if not _parse_bool(server_config.get("local_mode"), False) and _parse_bool(server_config.get("enable_upnp"), True):
             apply_upnp_mapping(port)
-        discover_auth_public_endpoint(port)
+        if not _parse_bool(server_config.get("local_mode"), False):
+            discover_auth_public_endpoint(port)
+
+    # Start UDP auth server in a daemon thread — it uses blocking socket I/O
+    # and must not run as an asyncio task or it will starve the event loop.
+    udp_thread = threading.Thread(target=udp_auth_server, args=(port,), daemon=True)
+    udp_thread.start()
 
     server_running = True
     log_message(f"Listening on {server.getsockname()}")
     status = "Listening..."
 
+    last_title_update_ts = 0.0
     while True:
-        # Only try to set the console title on Windows. Calling external
-        # commands while curses controls the terminal can break remote
-        # terminals (PuTTY/SSH). Skip on POSIX systems.
         try:
             if os.name == 'nt':
-                os.system('title bNET Auth - Status: ' + status)
+                now_ts = time.time()
+                if now_ts - last_title_update_ts >= 2.0:
+                    last_title_update_ts = now_ts
+                    threading.Thread(
+                        target=os.system,
+                        args=('title bNET Auth - Status: ' + status,),
+                        daemon=True,
+                    ).start()
         except Exception:
             pass
 
@@ -826,6 +1437,7 @@ async def handle_client(client):
 
     try:
         while True:
+            response = None
             request = await \
                 asyncio.get_event_loop().run_in_executor(
                     None, client.socket.recv, 1024)
@@ -944,7 +1556,7 @@ async def handle_client(client):
                     }
 
             elif request.startswith("REGISTER_ENDPOINT::"):
-                # v2: REGISTER_ENDPOINT::bID::password::listen_port::public_ip|AUTO::public_port|AUTO
+                # v2: REGISTER_ENDPOINT::bID::password::listen_port::public_ip|AUTO::public_port|AUTO[::private_ip]
                 parts = request.split("::")
                 if len(parts) < 6:
                     response = "REGISTER::FAILED::INVALID_FORMAT"
@@ -954,6 +1566,8 @@ async def handle_client(client):
                     listen_port = _parse_int(parts[3], 0)
                     requested_public_ip = parts[4]
                     requested_public_port = parts[5]
+                    # Optional field: client-reported LAN IP (avoids storing loopback as private IP)
+                    client_reported_private_ip = parts[6].strip() if len(parts) > 6 else ""
 
                     data = load_user_data()
 
@@ -979,9 +1593,22 @@ async def handle_client(client):
                         else:
                             public_port = _parse_int(requested_public_port, listen_port)
 
+                        # Determine the private (LAN) IP: prefer client-reported value, but
+                        # fall back to observed_ip.  If both are loopback, use public_ip so
+                        # the private route is at least reachable within the same network.
+                        def _is_loopback_ip(ip):
+                            return str(ip or "").startswith("127.") or ip in ("::1", "localhost")
+
+                        if client_reported_private_ip and not _is_loopback_ip(client_reported_private_ip):
+                            private_ip = client_reported_private_ip
+                        elif not _is_loopback_ip(observed_ip):
+                            private_ip = observed_ip
+                        else:
+                            private_ip = public_ip
+
                         active_sessions[thisbID] = {
                             "bID": thisbID,
-                            "private_ip": observed_ip,
+                            "private_ip": private_ip,
                             "private_port": listen_port,
                             "public_ip": public_ip,
                             "public_port": public_port,
@@ -989,6 +1616,9 @@ async def handle_client(client):
                             "last_seen_ts": time.time(),
                             "last_seen_iso": now_utc_iso(),
                             "is_online": True,
+                            # Tracks what peers we've already told this client about
+                            # via HEARTBEAT hints.  0 = never notified (send all on first HB).
+                            "last_peer_notify_ts": 0,
                         }
 
                         client.conn_port = listen_port
@@ -1150,10 +1780,47 @@ async def handle_client(client):
                 else:
                     hb_bid = parts[1]
                     if hb_bid in active_sessions:
-                        active_sessions[hb_bid]["last_seen_ts"] = time.time()
+                        now_ts = time.time()
+                        active_sessions[hb_bid]["last_seen_ts"] = now_ts
                         active_sessions[hb_bid]["last_seen_iso"] = now_utc_iso()
                         active_sessions[hb_bid]["is_online"] = True
-                        response = "HEARTBEAT::OK"
+
+                        # Piggyback any peers that became active since the last
+                        # time we told this client about them (0 = send everyone).
+                        last_notify = active_sessions[hb_bid].get("last_peer_notify_ts", 0)
+                        new_peer_entries = []
+                        for bid, session in active_sessions.items():
+                            if bid == hb_bid:
+                                continue
+                            if not session.get("is_online"):
+                                continue
+                            if session.get("last_seen_ts", 0) <= last_notify:
+                                continue
+                            pub_ip = session.get("public_ip")
+                            pub_port = session.get("public_port")
+                            priv_ip = session.get("private_ip")
+                            priv_port = session.get("private_port")
+                            if pub_ip and pub_port and priv_ip and priv_port:
+                                new_peer_entries.append(
+                                    f"{bid};{pub_ip}:{pub_port};{priv_ip}:{priv_port}"
+                                )
+                        active_sessions[hb_bid]["last_peer_notify_ts"] = now_ts
+
+                        if new_peer_entries:
+                            response = "HEARTBEAT::OK::PEERS::" + "::".join(new_peer_entries)
+                        else:
+                            response = "HEARTBEAT::OK"
+
+                        # Piggyback any pending relay invites for this peer.
+                        pending_invites = active_sessions[hb_bid].pop("pending_relay_invites", [])
+                        if pending_invites:
+                            invite_parts = [
+                                f"{inv['from_bid']}:{inv['token']}"
+                                for inv in pending_invites
+                                if inv.get("from_bid") and inv.get("token")
+                            ]
+                            if invite_parts:
+                                response += "::RELAY_INVITES::" + "::".join(invite_parts)
                     else:
                         response = "HEARTBEAT::FAILED::UNKNOWN_BID"
 
@@ -1163,18 +1830,176 @@ async def handle_client(client):
                 else:
                     response = "AUTH_ENDPOINT::UNKNOWN"
 
+
+            # ---
+            # GET_NETWORK_STATUS: Returns the current network exposure state.
+            #   - BOUND: Local port the server is bound to
+            #   - PUBLIC: Public IP:port as detected by UPnP or STUN, or UNKNOWN
+            #   - UPNP: ON if UPnP mapping is active, OFF otherwise
+            # Example: NETWORK_STATUS::BOUND::30301::PUBLIC::203.0.113.42:30301::UPNP::ON
+            # ---
             elif request.startswith("GET_NETWORK_STATUS"):
                 public = "UNKNOWN"
                 if auth_public_endpoint:
                     public = f"{auth_public_endpoint['public_ip']}:{auth_public_endpoint['public_port']}"
                 upnp = "ON" if network_state.get("upnp_active") else "OFF"
                 bound = str(network_state.get("bound_port", "UNKNOWN"))
-                response = f"NETWORK_STATUS::BOUND::{bound}::PUBLIC::{public}::UPNP::{upnp}"
+                mode = get_network_mode_label()
+                response = f"NETWORK_STATUS::MODE::{mode}::BOUND::{bound}::PUBLIC::{public}::UPNP::{upnp}"
 
             # Ping request
             #
             elif request.startswith("PING"):
                 response = "PONG"
+
+            # ---
+            # REQUEST_RELAY::myBID::password::targetBID
+            #   Creates a relay session and returns a one-time token.
+            #   The requesting peer should immediately open a new TCP connection
+            #   to auth and send JOIN_RELAY::token::myBID::password to claim the
+            #   "from" slot.  The target peer's next heartbeat will carry a
+            #   RELAY_INVITE hint so it can JOIN_RELAY to claim the "to" slot.
+            #   Once both slots are filled auth pipes the two sockets together.
+            # ---
+            elif request.startswith("REQUEST_RELAY::"):
+                parts = request.split("::")
+                if len(parts) < 4:
+                    response = "RELAY::FAILED::INVALID_FORMAT"
+                else:
+                    relay_req_bid = parts[1]
+                    relay_req_pass = parts[2]
+                    relay_target_bid = parts[3]
+                    data = load_user_data()
+                    _, auth_error = authenticate_request(data, relay_req_bid, relay_req_pass)
+                    if auth_error:
+                        response = auth_error
+                    elif relay_target_bid not in active_sessions or not active_sessions[relay_target_bid].get("is_online"):
+                        response = "RELAY::FAILED::TARGET_OFFLINE"
+                    else:
+                        _cleanup_stale_relay_sessions()
+                        # Deduplicate: if a pending relay session already exists
+                        # between the same two peers (in either direction) and
+                        # still has an open slot, reuse that token so both peers
+                        # end up joining the same session rather than each
+                        # creating their own and waiting forever.
+                        pair = {relay_req_bid, relay_target_bid}
+                        relay_token = None
+                        with relay_sessions_lock:
+                            for tok, rs in relay_sessions.items():
+                                if {rs["from_bid"], rs["to_bid"]} == pair:
+                                    relay_token = tok
+                                    log_message(
+                                        f"[relay] Reusing existing session {tok[:8]}... "
+                                        f"for {relay_req_bid} \u2194 {relay_target_bid}"
+                                    )
+                                    break
+                            if relay_token is None:
+                                relay_token = secrets.token_hex(16)
+                                relay_sessions[relay_token] = {
+                                    "from_bid": relay_req_bid,
+                                    "to_bid": relay_target_bid,
+                                    "from_sock": None,
+                                    "to_sock": None,
+                                    "created_ts": time.time(),
+                                }
+                                log_message(
+                                    f"[relay] Session {relay_token[:8]}... created: "
+                                    f"{relay_req_bid} \u2192 {relay_target_bid}"
+                                )
+                        # Queue a relay invite on the target's session so their
+                        # next heartbeat response carries it.
+                        if relay_target_bid in active_sessions:
+                            active_sessions[relay_target_bid].setdefault(
+                                "pending_relay_invites", []
+                            ).append({"from_bid": relay_req_bid, "token": relay_token})
+                        response = f"RELAY::PENDING::{relay_token}"
+
+            # ---
+            # JOIN_RELAY::token::myBID::password
+            #   Claims one slot in an existing relay session.  When both slots
+            #   are filled auth starts two pipe threads and exits handle_client
+            #   without closing the socket (relay_mode=True).
+            # ---
+            elif request.startswith("JOIN_RELAY::"):
+                parts = request.split("::")
+                if len(parts) < 4:
+                    response = "RELAY::FAILED::INVALID_FORMAT"
+                else:
+                    join_token = parts[1]
+                    join_bid = parts[2]
+                    join_pass = parts[3]
+                    data = load_user_data()
+                    _, auth_error = authenticate_request(data, join_bid, join_pass)
+                    if auth_error:
+                        response = auth_error
+                    else:
+                        with relay_sessions_lock:
+                            rs = relay_sessions.get(join_token)
+                            if not rs:
+                                response = "RELAY::FAILED::UNKNOWN_TOKEN"
+                            elif join_bid not in (rs["from_bid"], rs["to_bid"]):
+                                response = "RELAY::FAILED::NOT_INVITED"
+                            elif rs["from_sock"] is not None and rs["to_sock"] is not None:
+                                response = "RELAY::FAILED::ALREADY_FULL"
+                            else:
+                                # Assign socket to the correct slot.
+                                if join_bid == rs["from_bid"] and rs["from_sock"] is None:
+                                    rs["from_sock"] = client.socket
+                                elif rs["to_sock"] is None:
+                                    rs["to_sock"] = client.socket
+
+                                both_ready = (
+                                    rs["from_sock"] is not None
+                                    and rs["to_sock"] is not None
+                                )
+                                if both_ready:
+                                    # Both peers are present — start the relay pipe.
+                                    from_sock = rs["from_sock"]
+                                    to_sock = rs["to_sock"]
+                                    relay_sessions.pop(join_token, None)
+                                    log_message(
+                                        f"[relay] {join_token[:8]}... both peers joined "
+                                        f"({rs['from_bid']} \u2194 {rs['to_bid']}) — piping"
+                                    )
+                                    # Notify both peers.
+                                    try:
+                                        from_sock.sendall("RELAY::OK".encode())
+                                    except Exception:
+                                        pass
+                                    try:
+                                        to_sock.sendall("RELAY::OK".encode())
+                                    except Exception:
+                                        pass
+                                    # Pipe threads own both sockets from here.
+                                    threading.Thread(
+                                        target=_relay_pipe,
+                                        args=(from_sock, to_sock, f"{join_token[:8]} fwd"),
+                                        daemon=True,
+                                    ).start()
+                                    threading.Thread(
+                                        target=_relay_pipe,
+                                        args=(to_sock, from_sock, f"{join_token[:8]} rev"),
+                                        daemon=True,
+                                    ).start()
+                                    client.relay_mode = True
+                                    response = None
+                                    break  # Exit handle_client recv loop
+                                else:
+                                    # First joiner — wait for the other peer.
+                                    # Mark relay_mode so the socket stays open when
+                                    # handle_client exits after this break.
+                                    client.relay_mode = True
+                                    log_message(
+                                        f"[relay] {join_token[:8]}... first peer joined "
+                                        f"({join_bid}), waiting for partner"
+                                    )
+                                    # Send RELAY::WAITING so the client knows to block.
+                                    try:
+                                        client.socket.sendall("RELAY::WAITING".encode())
+                                    except Exception:
+                                        pass
+                                    response = None
+                                    break  # Exit handle_client recv loop
 
             else:
                 log_message("Unknown request")
@@ -1194,36 +2019,43 @@ async def handle_client(client):
             pass
     finally:
         # set the client status to offline
-        try:
-            data = load_user_data()
+        # Skip for relay-mode sockets: this connection is a temporary pipe for
+        # a relay session, not the client's main auth connection. Marking the
+        # account offline here would incorrectly evict a still-active user.
+        if getattr(client, 'relay_mode', False):
+            log_message(f"[relay] Skipping offline marking for relay socket ({this_clientbID})")
+        else:
+            try:
+                data = load_user_data()
 
-            # Mark this client offline only if we know its bID and it exists in the data
-            if this_clientbID and this_clientbID in data.get("bNETauth_data", {}).get("clients", {}):
-                try:
-                    if data["bNETauth_data"]["clients"][this_clientbID]["data"].get("status") == "online":
-                        data["bNETauth_data"]["clients"][this_clientbID]["data"]["status"] = "offline"
-                except Exception:
-                    # Defensive: if structure is unexpected, don't crash finalizer
-                    pass
+                # Mark this client offline only if we know its bID and it exists in the data
+                if this_clientbID and this_clientbID in data.get("bNETauth_data", {}).get("clients", {}):
+                    try:
+                        if data["bNETauth_data"]["clients"][this_clientbID]["data"].get("status") == "online":
+                            data["bNETauth_data"]["clients"][this_clientbID]["data"]["status"] = "offline"
+                    except Exception:
+                        # Defensive: if structure is unexpected, don't crash finalizer
+                        pass
 
-                if this_clientbID in active_sessions:
-                    active_sessions[this_clientbID]["is_online"] = False
-                    active_sessions[this_clientbID]["last_seen_ts"] = time.time()
-                    active_sessions[this_clientbID]["last_seen_iso"] = now_utc_iso()
+                    if this_clientbID in active_sessions:
+                        active_sessions[this_clientbID]["is_online"] = False
+                        active_sessions[this_clientbID]["last_seen_ts"] = time.time()
+                        active_sessions[this_clientbID]["last_seen_iso"] = now_utc_iso()
 
-            save_user_data(data)
-        except Exception as e:
-            log_message(f"Error updating client status: {e}")
+                save_user_data(data)
+            except Exception as e:
+                log_message(f"Error updating client status: {e}")
 
         # Close the client socket
-        try:
-            client.socket.send("CLOSED".encode('utf-8'))
-        except Exception:
-            pass
-        try:
-            client.socket.close()
-        except Exception:
-            pass
+        if not getattr(client, 'relay_mode', False):
+            try:
+                client.socket.send("CLOSED".encode('utf-8'))
+            except Exception:
+                pass
+            try:
+                client.socket.close()
+            except Exception:
+                pass
         try:
             clients.remove(client)
         except ValueError:
@@ -1296,6 +2128,7 @@ def init():
             default_settings = {
                 "server": {
                     "default_port": 30301,
+                    "local_mode": False,
                     "bind_host": "0.0.0.0",
                     "listen_backlog": 128,
                     "accept_timeout_sec": 1.0,
@@ -1334,6 +2167,7 @@ def init():
 
                     srv_cfg = settings_data.get("server", {})
                     server_config["default_port"] = _parse_int(srv_cfg.get("default_port"), server_config["default_port"])
+                    server_config["local_mode"] = _parse_bool(srv_cfg.get("local_mode"), server_config["local_mode"])
                     server_config["bind_host"] = str(srv_cfg.get("bind_host", server_config["bind_host"]))
                     server_config["listen_backlog"] = _parse_int(srv_cfg.get("listen_backlog"), server_config["listen_backlog"])
                     server_config["accept_timeout_sec"] = float(srv_cfg.get("accept_timeout_sec", server_config["accept_timeout_sec"]))
@@ -1348,6 +2182,7 @@ def init():
                     server_config["network_refresh_sec"] = _parse_int(srv_cfg.get("network_refresh_sec"), server_config["network_refresh_sec"])
                     server_config["socket_keepalive"] = _parse_bool(srv_cfg.get("socket_keepalive"), server_config["socket_keepalive"])
                     env_override_config()
+                    apply_local_mode_overrides()
             except Exception as e:
                 log_message(f'Unable to load Settings json; {e}')
 
@@ -1388,6 +2223,9 @@ def init():
     try:
         status = 'Starting console thread...'
         curses.wrapper(console)
+    except KeyboardInterrupt:
+        status = 'Exiting...'
+        log_message('Console interrupted by operator')
     except Exception as e:
         log_message(f'Console failed: {e}')
 

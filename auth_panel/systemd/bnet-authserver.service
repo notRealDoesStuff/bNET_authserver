@@ -1,0 +1,23 @@
+[Unit]
+Description=bNET Authentication Server
+After=network.target
+Documentation=https://github.com/bleachdev/bNET
+
+[Service]
+Type=simple
+User=bnet
+Group=bnet
+WorkingDirectory=/opt/bNET/bNET_authserver/auth_panel
+ExecStart=/usr/bin/python3 /opt/bNET/bNET_authserver/auth_panel/server_main.py --headless
+EnvironmentFile=/opt/bNET/bNET_authserver/auth_panel/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bnet-authserver
+
+# Give the server time to shut down cleanly
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

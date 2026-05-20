@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>bNET Auth Panel</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- Login screen -->
+<div id="login-screen">
+    <div class="login-card">
+        <div class="login-logo">bNET</div>
+        <div class="login-sub">Authentication Server Panel</div>
+        <form id="login-form">
+            <label for="login-password">Admin Password</label>
+            <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required />
+            <button type="submit" id="login-btn">Sign In</button>
+            <p id="login-error" class="error-text" hidden></p>
+        </form>
+    </div>
+</div>
+
+<!-- Main app (hidden until authenticated) -->
+<div id="app" hidden>
+    <aside class="sidebar">
+        <div class="sidebar-brand">bNET Panel</div>
+        <nav>
+            <button class="nav-btn active" data-tab="dashboard">Dashboard</button>
+            <button class="nav-btn" data-tab="sessions">Sessions</button>
+            <button class="nav-btn" data-tab="logs">Logs</button>
+            <button class="nav-btn" data-tab="users">Users</button>
+            <button class="nav-btn" data-tab="settings">Settings</button>
+        </nav>
+        <div class="sidebar-footer">
+            <button id="logout-btn">Logout</button>
+        </div>
+    </aside>
+
+    <main class="content">
+
+        <!-- Dashboard tab -->
+        <section id="tab-dashboard" class="tab-pane active">
+            <h2>Dashboard</h2>
+            <div class="status-bar">
+                <span class="status-badge" id="svc-badge">Checking...</span>
+                <span class="uptime-label" id="uptime-label"></span>
+            </div>
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Connected Clients</div>
+                    <div class="stat-value" id="stat-clients">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Active Sessions</div>
+                    <div class="stat-value" id="stat-sessions">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Public Endpoint</div>
+                    <div class="stat-value small" id="stat-endpoint">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">UPnP</div>
+                    <div class="stat-value" id="stat-upnp">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Bound Port</div>
+                    <div class="stat-value" id="stat-port">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Network Mode</div>
+                    <div class="stat-value" id="stat-mode">—</div>
+                </div>
+            </div>
+            <div class="action-row">
+                <button class="btn btn-green" id="btn-start">Start</button>
+                <button class="btn btn-red" id="btn-stop">Stop</button>
+                <button class="btn btn-blue" id="btn-restart">Restart</button>
+            </div>
+            <p id="dashboard-msg" class="info-msg" hidden></p>
+            <p id="dashboard-err" class="error-text" hidden></p>
+        </section>
+
+        <!-- Sessions tab -->
+        <section id="tab-sessions" class="tab-pane">
+            <h2>Active Sessions</h2>
+            <table class="data-table" id="sessions-table">
+                <thead>
+                    <tr>
+                        <th>bID</th>
+                        <th>Online</th>
+                        <th>Public Endpoint</th>
+                        <th>Private Endpoint</th>
+                        <th>Last Seen</th>
+                    </tr>
+                </thead>
+                <tbody id="sessions-tbody">
+                    <tr><td colspan="5" class="empty-row">Loading...</td></tr>
+                </tbody>
+            </table>
+
+            <h2 style="margin-top:2rem;">Relay Sessions</h2>
+            <table class="data-table" id="relay-table">
+                <thead>
+                    <tr>
+                        <th>Token</th>
+                        <th>From</th>
+                        <th>To</th>
+                        <th>From Connected</th>
+                        <th>To Connected</th>
+                        <th>Age</th>
+                    </tr>
+                </thead>
+                <tbody id="relay-tbody">
+                    <tr><td colspan="6" class="empty-row">Loading...</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Logs tab -->
+        <section id="tab-logs" class="tab-pane">
+            <h2>Live Logs
+                <label class="toggle-label" style="margin-left:1rem;">
+                    <input type="checkbox" id="autoscroll-chk" checked /> Auto-scroll
+                </label>
+                <button class="btn btn-sm" id="clear-logs-btn" style="margin-left:1rem;">Clear</button>
+                <span id="ws-status" class="ws-status">●</span>
+            </h2>
+            <pre id="log-box"></pre>
+        </section>
+
+        <!-- Users tab -->
+        <section id="tab-users" class="tab-pane">
+            <h2>Users</h2>
+            <form id="add-user-form" class="inline-form">
+                <input type="text" id="new-bid" placeholder="32-char hex bID" maxlength="32" pattern="[0-9a-fA-F]{32}" required />
+                <input type="password" id="new-pass" placeholder="Password" required />
+                <button type="submit" class="btn btn-green">Add User</button>
+                <span id="add-user-err" class="error-text" hidden></span>
+            </form>
+            <table class="data-table" id="users-table">
+                <thead>
+                    <tr>
+                        <th>bID</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="users-tbody">
+                    <tr><td colspan="3" class="empty-row">Loading...</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Settings tab -->
+        <section id="tab-settings" class="tab-pane">
+            <h2>Server Settings</h2>
+            <p id="settings-restart-notice" class="warn-text" hidden>
+                Settings saved. Restart the server for changes to take effect.
+            </p>
+            <p id="settings-err" class="error-text" hidden></p>
+            <form id="settings-form">
+                <div id="settings-fields"></div>
+                <button type="submit" class="btn btn-blue" style="margin-top:1.5rem;">Save Settings</button>
+            </form>
+        </section>
+
+    </main>
+</div>
+
+<!-- Change password modal -->
+<div id="chpass-modal" class="modal-overlay" hidden>
+    <div class="modal-card">
+        <h3>Change Password</h3>
+        <p id="chpass-bid-label"></p>
+        <input type="password" id="chpass-input" placeholder="New password" />
+        <div class="modal-actions">
+            <button class="btn btn-blue" id="chpass-confirm">Save</button>
+            <button class="btn" id="chpass-cancel">Cancel</button>
+        </div>
+        <p id="chpass-err" class="error-text" hidden></p>
+    </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

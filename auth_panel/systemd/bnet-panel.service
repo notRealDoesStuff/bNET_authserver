@@ -1,0 +1,22 @@
+[Unit]
+Description=bNET Auth Panel (Node.js)
+After=network.target
+Documentation=https://github.com/bleachdev/bNET
+
+[Service]
+Type=simple
+User=bnet
+Group=bnet
+WorkingDirectory=/opt/bNET/bNET_authserver/auth_panel
+ExecStart=/usr/bin/node /opt/bNET/bNET_authserver/auth_panel/server.js
+EnvironmentFile=/opt/bNET/bNET_authserver/auth_panel/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bnet-panel
+
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

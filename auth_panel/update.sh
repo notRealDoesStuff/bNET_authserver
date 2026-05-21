@@ -7,7 +7,8 @@ REPO_DIR="/opt/bNET/bNET_authserver"
 PANEL_DIR="$REPO_DIR/auth_panel"
 
 echo "[update] Pulling latest changes from GitHub..."
-git -C "$REPO_DIR" pull
+git -C "$REPO_DIR" fetch origin
+git -C "$REPO_DIR" reset --hard origin/HEAD
 
 echo "[update] Installing Node.js dependencies..."
 cd "$PANEL_DIR"

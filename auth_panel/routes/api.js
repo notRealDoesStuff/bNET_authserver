@@ -62,7 +62,7 @@ function queryAuthServer(token, timeoutMs = 4000) {
 
 function systemctlAction(action) {
     return new Promise((resolve, reject) => {
-        execFile('systemctl', [action, 'bnet-authserver'], (err, stdout, stderr) => {
+        execFile('sudo', ['systemctl', action, 'bnet-authserver'], (err, stdout, stderr) => {
             if (err) reject(new Error((stderr || '').trim() || err.message));
             else resolve((stdout || '').trim());
         });
@@ -71,7 +71,7 @@ function systemctlAction(action) {
 
 function systemctlIsActive() {
     return new Promise((resolve) => {
-        execFile('systemctl', ['is-active', 'bnet-authserver'], (_err, stdout) => {
+        execFile('sudo', ['systemctl', 'is-active', 'bnet-authserver'], (_err, stdout) => {
             resolve((stdout || '').trim());
         });
     });

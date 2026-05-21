@@ -64,9 +64,8 @@ wss.on('connection', (ws) => {
         '-n', '200',
         '--no-pager',
         '--output=short',
-        '--no-color',
         '-q',
-    ]);
+    ], { env: { ...process.env, TERM: 'dumb' } });
 
     // Strip ANSI escape codes
     const stripAnsi = (str) => str.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');

@@ -3,7 +3,7 @@
 # Called by the web panel via sudo. Do not run directly as bnet user.
 set -euo pipefail
 
-REPO_DIR="/opt/bNET"
+REPO_DIR="/opt/bNET/bNET_authserver"
 PANEL_DIR="$REPO_DIR/bNET_authserver/auth_panel"
 
 echo "[update] Pulling latest changes from GitHub..."

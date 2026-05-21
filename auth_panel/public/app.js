@@ -193,7 +193,14 @@ async function loadStatus() {
     } else {
         text('uptime-label', '');
         ['stat-clients','stat-sessions','stat-endpoint','stat-upnp','stat-port','stat-mode']
-            .forEach(id => text(id, data.admin_error ? 'N/A' : '—'));
+            .forEach(id => text(id, '—'));
+        const adminErrEl = el('admin-err');
+        if (data.admin_error) {
+            adminErrEl.textContent = 'Auth server unreachable: ' + data.admin_error;
+            show(adminErrEl);
+        } else {
+            hide(adminErrEl);
+        }
     }
 }
 

@@ -278,10 +278,11 @@ router.put('/settings', requireAuth, (req, res) => {
 const UPDATE_SCRIPT = path.join(__dirname, '..', 'update.sh');
 
 router.post('/update', requireAuth, (req, res) => {
-    execFile('sudo', ['bash', UPDATE_SCRIPT], { timeout: 120000 }, (err, stdout, stderr) => {
+    execFile('sudo', [UPDATE_SCRIPT], { timeout: 120000 }, (err, stdout, stderr) => {
         const output = (stdout + stderr).trim();
+        const detail = err ? `[exit ${err.code}] ${err.message}` : '';
         if (err && err.code !== 0) {
-            return res.status(500).json({ ok: false, output });
+            return res.status(500).json({ ok: false, output: output || detail });
         }
         res.json({ ok: true, output });
     });

@@ -44,9 +44,11 @@ import base64
 import secrets
 from collections import deque
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import bnet_stun
 
 HEADLESS_MODE = "--headless" in sys.argv
+STATS_PORT = int(os.environ.get("BNET_STATS_PORT", "30311"))
 
 def udp_auth_server(listen_port):
     """
@@ -2255,6 +2257,9 @@ def init():
             show_prelog_and_exit()
 
     status = 'Initializing...'
+
+    # Start the HTTP stats server on 127.0.0.1:30311
+    start_stats_http_server()
 
     try:
         if not os.path.exists(default_storage_path):

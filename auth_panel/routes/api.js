@@ -2,7 +2,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const net = require('net');
+const http = require('http');
 const { execFile } = require('child_process');
 
 const express = require('express');
@@ -16,7 +16,7 @@ const USERS_PATH = path.join(DATA_DIR, 'users.json');
 const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
 
 const AUTH_SERVER_HOST = '127.0.0.1';
-const AUTH_SERVER_PORT = parseInt(process.env.AUTH_SERVER_PORT || '30301', 10);
+const STATS_PORT = parseInt(process.env.BNET_STATS_PORT || '30311', 10);
 const ADMIN_TOKEN = process.env.BNET_ADMIN_TOKEN || '';
 
 // ---------------------------------------------------------------
@@ -37,44 +37,26 @@ function writeJson(filePath, data) {
 }
 
 /**
- * Open a TCP connection to the auth server, send ADMIN_STATUS::token,
- * read the full response, and resolve with the parsed JSON payload.
+ * Query the auth server's HTTP stats endpoint on 127.0.0.1:30311.
  */
 function queryAuthServer(token, timeoutMs = 4000) {
     return new Promise((resolve, reject) => {
-        const sock = new net.Socket();
-        let buffer = '';
-
-        const timer = setTimeout(() => {
-            sock.destroy();
-            reject(new Error('Auth server TCP timeout'));
-        }, timeoutMs);
-
-        sock.connect(AUTH_SERVER_PORT, AUTH_SERVER_HOST, () => {
-            sock.write(`ADMIN_STATUS::${token}`);
-        });
-
-        sock.on('data', (chunk) => { buffer += chunk.toString(); });
-
-        sock.on('end', () => {
-            clearTimeout(timer);
-            const PREFIX = 'ADMIN_STATUS::';
-            if (!buffer.startsWith(PREFIX)) {
-                return reject(new Error('Unexpected response: ' + buffer.slice(0, 80)));
+        const req = http.get(
+            { host: AUTH_SERVER_HOST, port: STATS_PORT, path: '/stats',
+              headers: { Authorization: `Bearer ${token}` }, timeout: timeoutMs },
+            (res) => {
+                let body = '';
+                res.on('data', (c) => { body += c; });
+                res.on('end', () => {
+                    if (res.statusCode === 401) return reject(new Error('Admin token rejected by server'));
+                    if (res.statusCode !== 200) return reject(new Error(`Stats server returned ${res.statusCode}`));
+                    try { resolve(JSON.parse(body)); }
+                    catch (_) { reject(new Error('Malformed JSON from stats server')); }
+                });
             }
-            const payload = buffer.slice(PREFIX.length);
-            if (payload === 'DENIED') return reject(new Error('Admin token rejected by server'));
-            try {
-                resolve(JSON.parse(payload));
-            } catch (_) {
-                reject(new Error('Malformed JSON in ADMIN_STATUS response'));
-            }
-        });
-
-        sock.on('error', (err) => {
-            clearTimeout(timer);
-            reject(err);
-        });
+        );
+        req.on('timeout', () => { req.destroy(); reject(new Error('Stats server timeout')); });
+        req.on('error', reject);
     });
 }
 

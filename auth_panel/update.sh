@@ -4,7 +4,7 @@
 set -euo pipefail
 
 REPO_DIR="/opt/bNET/bNET_authserver"
-PANEL_DIR="$REPO_DIR/bNET_authserver/auth_panel"
+PANEL_DIR="$REPO_DIR/auth_panel"
 
 echo "[update] Pulling latest changes from GitHub..."
 git -C "$REPO_DIR" pull

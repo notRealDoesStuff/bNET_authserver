@@ -494,6 +494,30 @@ el('settings-form').addEventListener('submit', async (e) => {
 });
 
 // ================================================================
+// GitHub Update
+// ================================================================
+el('update-btn').addEventListener('click', async () => {
+    const btn = el('update-btn');
+    const out = el('update-output');
+    const err = el('update-err');
+
+    btn.disabled = true;
+    btn.textContent = 'Updating…';
+    hide(err);
+    out.textContent = 'Running update…';
+    show(out);
+
+    const { ok, data } = await api.post('/api/update');
+    out.textContent = data.output || '(no output)';
+    btn.disabled = false;
+    btn.textContent = 'Pull & Update';
+
+    if (!ok) {
+        showError('update-err', data.error || 'Update failed');
+    }
+});
+
+// ================================================================
 // Security helpers
 // ================================================================
 function escHtml(str) {

@@ -31,6 +31,7 @@
 
 import os
 import socket
+import struct
 import time
 import asyncio
 import threading
@@ -243,8 +244,38 @@ relay_sessions = {}
 relay_sessions_lock = threading.Lock()
 RELAY_SESSION_TIMEOUT_SEC = 120
 
+# ── UDP relay state ────────────────────────────────────────────────────────────
+# Peers that cannot hole-punch UDP register here so the auth server can forward
+# binary audio (and future screen-share) frames between them.
+#
+# Registration frame (client → server):  [4B magic 0xBEEFCAFE][32B ASCII token][1B stream_type]
+# Data frame        (client → server):   [4B relay_id BE][1B stream_type][...payload]
+# ACK               (server → client):   [4B magic][0x00]
+#
+# relay_id is derived from the relay token: int(token[:8], 16)
+_UDP_RELAY_MAGIC = 0xBEEFCAFE
+_UDP_RELAY_MAGIC_BYTES = struct.pack("!I", _UDP_RELAY_MAGIC)
 
-def _relay_pipe(src_sock, dst_sock, label):
+# relay_id (int) → {"token": str, "udp_slots": {stream_type(int): [from_addr|None, to_addr|None]}}
+_udp_relay_sessions = {}
+# (ip, port) → (relay_id, stream_type, peer_slot_idx)  where peer_slot_idx is the OTHER peer's slot
+_udp_relay_map = {}
+_udp_relay_lock = threading.Lock()
+
+
+def _cleanup_udp_relay_session(relay_id):
+    """Evict all UDP relay state for relay_id (called when the TCP pipe closes)."""
+    with _udp_relay_lock:
+        session = _udp_relay_sessions.pop(relay_id, None)
+        if not session:
+            return
+        stale_addrs = [addr for addr, info in _udp_relay_map.items() if info[0] == relay_id]
+        for addr in stale_addrs:
+            _udp_relay_map.pop(addr, None)
+    log_message(f"[relay-udp] Cleaned up UDP relay session relay_id={relay_id:#010x}")
+
+
+def _relay_pipe(src_sock, dst_sock, label, relay_id=None):
     """Blocking pipe: forward bytes from src_sock to dst_sock until either closes."""
     try:
         while True:
@@ -261,6 +292,91 @@ def _relay_pipe(src_sock, dst_sock, label):
             except Exception:
                 pass
         log_message(f"[relay] pipe {label} closed")
+        if relay_id is not None:
+            _cleanup_udp_relay_session(relay_id)
+
+
+def _udp_relay_loop(udp_relay_port):
+    """Forward UDP audio/screen frames between relay-connected peers.
+
+    Peers register by sending a registration frame; subsequent data frames are
+    forwarded verbatim to the paired peer's registered address.
+    """
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        udp_sock.bind((server_config.get("bind_host", "0.0.0.0"), udp_relay_port))
+    except Exception as exc:
+        log_message(f"[relay-udp] Bind failed on port {udp_relay_port}: {exc}")
+        return
+    log_message(f"[relay-udp] UDP relay listening on port {udp_relay_port}")
+
+    while True:
+        try:
+            data, addr = udp_sock.recvfrom(8192)
+        except Exception:
+            continue
+
+        if len(data) < 5:
+            continue
+
+        # Registration frame: [4B magic][32B token ASCII][1B stream_type] — total 37 bytes
+        if data[:4] == _UDP_RELAY_MAGIC_BYTES and len(data) >= 37:
+            try:
+                token = data[4:36].decode("ascii")
+                stream_type = data[36]
+            except Exception:
+                continue
+            relay_id = int(token[:8], 16)
+            with _udp_relay_lock:
+                session = _udp_relay_sessions.get(relay_id)
+                if session is None or session.get("token") != token:
+                    # Unknown or expired session — ignore
+                    continue
+                slots = session["udp_slots"].setdefault(stream_type, [None, None])
+                if addr == slots[0] or addr == slots[1]:
+                    pass  # Re-registration: just re-ACK
+                elif slots[0] is None:
+                    slots[0] = addr
+                    _udp_relay_map[addr] = (relay_id, stream_type, 1)  # forward to slot 1
+                elif slots[1] is None:
+                    slots[1] = addr
+                    _udp_relay_map[addr] = (relay_id, stream_type, 0)  # forward to slot 0
+                else:
+                    continue  # Both slots full
+            # Send ACK
+            try:
+                udp_sock.sendto(_UDP_RELAY_MAGIC_BYTES + b"\x00", addr)
+            except Exception:
+                pass
+            log_message(
+                f"[relay-udp] Registered {addr} relay_id={relay_id:#010x} stream={stream_type:#04x}"
+            )
+            continue
+
+        # Data frame: [4B relay_id BE][1B stream_type][...payload]
+        recv_relay_id = struct.unpack("!I", data[:4])[0]
+        recv_stream_type = data[4]
+        with _udp_relay_lock:
+            info = _udp_relay_map.get(addr)
+            if info is None:
+                continue
+            ri, st, peer_slot = info
+            if ri != recv_relay_id or st != recv_stream_type:
+                continue
+            session = _udp_relay_sessions.get(ri)
+            if session is None:
+                continue
+            slots = session["udp_slots"].get(st)
+            if not slots:
+                continue
+            dst_addr = slots[peer_slot]
+        if dst_addr is None:
+            continue
+        try:
+            udp_sock.sendto(data, dst_addr)
+        except Exception:
+            pass
 
 
 def _cleanup_stale_relay_sessions():
@@ -279,10 +395,12 @@ def _cleanup_stale_relay_sessions():
                     except Exception:
                         pass
             relay_sessions.pop(tok, None)
+            _cleanup_udp_relay_session(int(tok[:8], 16))
 
 
 server_config = {
     "default_port": 30301,
+    "udp_relay_port": 30302,     # UDP port for audio/screen relay frames
     "local_mode": False,
     "bind_host": "0.0.0.0",
     "listen_backlog": 128,
@@ -1384,6 +1502,13 @@ async def run_server():
     udp_thread = threading.Thread(target=udp_auth_server, args=(port,), daemon=True)
     udp_thread.start()
 
+    # Start UDP relay loop for audio/screen forwarding between relay-connected peers.
+    _udp_relay_port = server_config.get("udp_relay_port", 30302)
+    udp_relay_thread = threading.Thread(
+        target=_udp_relay_loop, args=(_udp_relay_port,), daemon=True
+    )
+    udp_relay_thread.start()
+
     server_running = True
     log_message(f"Listening on {server.getsockname()}")
     status = "Listening..."
@@ -1906,6 +2031,14 @@ async def handle_client(client):
                                     f"[relay] Session {relay_token[:8]}... created: "
                                     f"{relay_req_bid} \u2192 {relay_target_bid}"
                                 )
+                                # Register in UDP relay index so clients can
+                                # register UDP endpoints for this session.
+                                _relay_id = int(relay_token[:8], 16)
+                                with _udp_relay_lock:
+                                    _udp_relay_sessions[_relay_id] = {
+                                        "token": relay_token,
+                                        "udp_slots": {},
+                                    }
                         # Queue a relay invite on the target's session so their
                         # next heartbeat response carries it.
                         if relay_target_bid in active_sessions:
@@ -1961,24 +2094,32 @@ async def handle_client(client):
                                         f"[relay] {join_token[:8]}... both peers joined "
                                         f"({rs['from_bid']} \u2194 {rs['to_bid']}) — piping"
                                     )
-                                    # Notify both peers.
+                                    _pipe_relay_id = int(join_token[:8], 16)
+                                    _udp_rport = server_config.get("udp_relay_port", 30302)
+                                    # Notify both peers — include UDP relay port so clients
+                                    # can register audio frames without hole-punching.
                                     try:
-                                        from_sock.sendall("RELAY::OK".encode())
+                                        from_sock.sendall(
+                                            f"RELAY::OK::{_udp_rport}".encode()
+                                        )
                                     except Exception:
                                         pass
                                     try:
-                                        to_sock.sendall("RELAY::OK".encode())
+                                        to_sock.sendall(
+                                            f"RELAY::OK::{_udp_rport}".encode()
+                                        )
                                     except Exception:
                                         pass
                                     # Pipe threads own both sockets from here.
+                                    # Pass relay_id so they can clean up UDP state on exit.
                                     threading.Thread(
                                         target=_relay_pipe,
-                                        args=(from_sock, to_sock, f"{join_token[:8]} fwd"),
+                                        args=(from_sock, to_sock, f"{join_token[:8]} fwd", _pipe_relay_id),
                                         daemon=True,
                                     ).start()
                                     threading.Thread(
                                         target=_relay_pipe,
-                                        args=(to_sock, from_sock, f"{join_token[:8]} rev"),
+                                        args=(to_sock, from_sock, f"{join_token[:8]} rev", _pipe_relay_id),
                                         daemon=True,
                                     ).start()
                                     client.relay_mode = True

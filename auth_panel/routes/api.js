@@ -271,4 +271,20 @@ router.put('/settings', requireAuth, (req, res) => {
     }
 });
 
+// ---------------------------------------------------------------
+// GitHub update
+// ---------------------------------------------------------------
+
+const UPDATE_SCRIPT = path.join(__dirname, '..', 'update.sh');
+
+router.post('/update', requireAuth, (req, res) => {
+    execFile('sudo', ['bash', UPDATE_SCRIPT], { timeout: 120000 }, (err, stdout, stderr) => {
+        const output = (stdout + stderr).trim();
+        if (err && err.code !== 0) {
+            return res.status(500).json({ ok: false, output });
+        }
+        res.json({ ok: true, output });
+    });
+});
+
 module.exports = router;

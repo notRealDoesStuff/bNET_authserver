@@ -64,10 +64,15 @@ wss.on('connection', (ws) => {
         '-n', '200',
         '--no-pager',
         '--output=short',
+        '--no-color',
+        '-q',
     ]);
 
+    // Strip ANSI escape codes
+    const stripAnsi = (str) => str.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
+
     proc.stdout.on('data', (chunk) => {
-        const lines = chunk.toString().split('\n');
+        const lines = stripAnsi(chunk.toString()).split('\n');
         for (const line of lines) {
             if (line.trim() && ws.readyState === ws.OPEN) {
                 ws.send(line);
@@ -76,8 +81,10 @@ wss.on('connection', (ws) => {
     });
 
     proc.stderr.on('data', (chunk) => {
-        if (ws.readyState === ws.OPEN) {
-            ws.send('[stderr] ' + chunk.toString().trim());
+        const msg = stripAnsi(chunk.toString()).trim();
+        // Suppress the "insufficient permissions" noise — handled by group membership
+        if (msg && !msg.includes('No journal files') && !msg.includes('systemd-journal') && ws.readyState === ws.OPEN) {
+            ws.send('[panel] ' + msg);
         }
     });
 

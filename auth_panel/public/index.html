@@ -164,6 +164,13 @@
                 <div id="settings-fields"></div>
                 <button type="submit" class="btn btn-blue" style="margin-top:1.5rem;">Save Settings</button>
             </form>
+
+            <hr style="margin:2rem 0;border:none;border-top:1px solid var(--border);">
+            <h2>Update from GitHub</h2>
+            <p style="margin:.4rem 0 1rem;font-size:.875rem;color:var(--text-muted);">Pulls the latest code, reinstalls Node.js dependencies, and restarts both services.</p>
+            <button id="update-btn" class="btn btn-blue">Pull &amp; Update</button>
+            <p id="update-err" class="error-text" hidden></p>
+            <pre id="update-output" hidden style="margin-top:1rem;background:#1e2228;color:#d4d4d4;padding:1rem;border-radius:6px;font-size:.8rem;max-height:300px;overflow-y:auto;white-space:pre-wrap;"></pre>
         </section>
 
     </main>

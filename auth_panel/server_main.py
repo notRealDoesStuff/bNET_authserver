@@ -50,6 +50,72 @@ import bnet_stun
 HEADLESS_MODE = "--headless" in sys.argv
 STATS_PORT = int(os.environ.get("BNET_STATS_PORT", "30311"))
 
+# ---------------------------------------------------------------------------
+# HTTP Stats Server (127.0.0.1:STATS_PORT)
+# ---------------------------------------------------------------------------
+
+class _StatsHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # silence default access log
+        pass
+
+    def _build_payload(self):
+        with relay_sessions_lock:
+            relay_snapshot = {
+                tok: {
+                    "from_bid": rs["from_bid"],
+                    "to_bid": rs["to_bid"],
+                    "created_ts": rs["created_ts"],
+                    "from_connected": rs["from_sock"] is not None,
+                    "to_connected": rs["to_sock"] is not None,
+                }
+                for tok, rs in relay_sessions.items()
+            }
+        return {
+            "active_sessions": {
+                bid: {k: v for k, v in sess.items() if k != "pending_relay_invites"}
+                for bid, sess in active_sessions.items()
+            },
+            "relay_sessions": relay_snapshot,
+            "network_state": dict(network_state),
+            "server_config": dict(server_config),
+            "server_start_ts": server_started_ts,
+            "server_running": server_running,
+            "tcp_client_count": len(clients),
+        }
+
+    def do_GET(self):
+        if self.path != "/stats":
+            self.send_error(404)
+            return
+        auth = self.headers.get("Authorization", "")
+        token = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
+        admin_token = os.environ.get("BNET_ADMIN_TOKEN", "")
+        if not admin_token or not secrets.compare_digest(token, admin_token):
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b'{"error":"Unauthorized"}')
+            return
+        try:
+            body = json.dumps(self._build_payload()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(exc)}).encode())
+
+
+def start_stats_http_server():
+    def _run():
+        srv = HTTPServer(("127.0.0.1", STATS_PORT), _StatsHandler)
+        srv.serve_forever()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
 def udp_auth_server(listen_port):
     """
     Stateless UDP authentication server for direct client connections.

@@ -336,14 +336,35 @@ def _udp_relay_loop(udp_relay_port):
                 slots = session["udp_slots"].setdefault(stream_type, [None, None])
                 if addr == slots[0] or addr == slots[1]:
                     pass  # Re-registration: just re-ACK
-                elif slots[0] is None:
-                    slots[0] = addr
-                    _udp_relay_map[addr] = (relay_id, stream_type, 1)  # forward to slot 1
-                elif slots[1] is None:
-                    slots[1] = addr
-                    _udp_relay_map[addr] = (relay_id, stream_type, 0)  # forward to slot 0
                 else:
-                    continue  # Both slots full
+                    # Determine which slot to use.  If the incoming address
+                    # has the same IP as an existing slot (same client, new
+                    # ephemeral port after session restart) evict that slot.
+                    # Otherwise fill a free slot, or FIFO-evict slot 0 when
+                    # both are occupied by different IPs.
+                    if slots[0] is not None and slots[0][0] == addr[0]:
+                        evict_idx = 0
+                    elif slots[1] is not None and slots[1][0] == addr[0]:
+                        evict_idx = 1
+                    elif slots[0] is None:
+                        evict_idx = None
+                        slots[0] = addr
+                        _udp_relay_map[addr] = (relay_id, stream_type, 1)  # forward to slot 1
+                    elif slots[1] is None:
+                        evict_idx = None
+                        slots[1] = addr
+                        _udp_relay_map[addr] = (relay_id, stream_type, 0)  # forward to slot 0
+                    else:
+                        evict_idx = 0  # FIFO: evict oldest slot
+                    if evict_idx is not None:
+                        old_addr = slots[evict_idx]
+                        _udp_relay_map.pop(old_addr, None)
+                        slots[evict_idx] = addr
+                        _udp_relay_map[addr] = (relay_id, stream_type, 1 - evict_idx)
+                        log_message(
+                            f"[relay-udp] Evicted slot {evict_idx} ({old_addr}) "
+                            f"for {addr} relay_id={relay_id:#010x}"
+                        )
             # Send ACK
             try:
                 udp_sock.sendto(_UDP_RELAY_MAGIC_BYTES + b"\x00", addr)

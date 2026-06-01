@@ -340,9 +340,9 @@ def _cleanup_udp_relay_session(relay_id):
         session = _udp_relay_sessions.pop(relay_id, None)
         if not session:
             return
-        stale_addrs = [addr for addr, info in _udp_relay_map.items() if info[0] == relay_id]
-        for addr in stale_addrs:
-            _udp_relay_map.pop(addr, None)
+        stale_keys = [k for k in _udp_relay_map if k[1] == relay_id]
+        for k in stale_keys:
+            _udp_relay_map.pop(k, None)
     log_message(f"[relay-udp] Cleaned up UDP relay session relay_id={relay_id:#010x}")
 
 
@@ -419,18 +419,18 @@ def _udp_relay_loop(udp_relay_port):
                     elif slots[0] is None:
                         evict_idx = None
                         slots[0] = addr
-                        _udp_relay_map[addr] = (relay_id, stream_type, 1)
+                        _udp_relay_map[(addr, relay_id)] = (stream_type, 1)
                     elif slots[1] is None:
                         evict_idx = None
                         slots[1] = addr
-                        _udp_relay_map[addr] = (relay_id, stream_type, 0)
+                        _udp_relay_map[(addr, relay_id)] = (stream_type, 0)
                     else:
                         evict_idx = 0  # FIFO: evict oldest slot
                     if evict_idx is not None:
                         old_addr = slots[evict_idx]
-                        _udp_relay_map.pop(old_addr, None)
+                        _udp_relay_map.pop((old_addr, relay_id), None)
                         slots[evict_idx] = addr
-                        _udp_relay_map[addr] = (relay_id, stream_type, 1 - evict_idx)
+                        _udp_relay_map[(addr, relay_id)] = (stream_type, 1 - evict_idx)
                         log_message(
                             f"[relay-udp] Evicted slot {evict_idx} ({old_addr}) "
                             f"for {addr} relay_id={relay_id:#010x}"
@@ -448,13 +448,13 @@ def _udp_relay_loop(udp_relay_port):
         recv_relay_id = struct.unpack("!I", data[:4])[0]
         recv_stream_type = data[4]
         with _udp_relay_lock:
-            info = _udp_relay_map.get(addr)
+            info = _udp_relay_map.get((addr, recv_relay_id))
             if info is None:
                 continue
-            ri, st, peer_slot = info
-            if ri != recv_relay_id or st != recv_stream_type:
+            st, peer_slot = info
+            if st != recv_stream_type:
                 continue
-            session = _udp_relay_sessions.get(ri)
+            session = _udp_relay_sessions.get(recv_relay_id)
             if session is None:
                 continue
             slots = session["udp_slots"].get(st)

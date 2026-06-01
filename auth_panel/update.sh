@@ -10,6 +10,9 @@ echo "[update] Pulling latest changes from GitHub..."
 git -C "$REPO_DIR" fetch origin
 git -C "$REPO_DIR" reset --hard origin/HEAD
 
+echo "[update] Restoring execute permissions..."
+chmod +x "$PANEL_DIR/update.sh"
+
 echo "[update] Installing Node.js dependencies..."
 cd "$PANEL_DIR"
 npm install --omit=dev

@@ -17,7 +17,7 @@ echo "[update] Installing Node.js dependencies..."
 cd "$PANEL_DIR"
 npm install --omit=dev
 
-echo "[update] Restarting services..."
-systemctl restart bnet-authserver bnet-panel
+echo "[update] Restarting auth server..."
+systemctl restart bnet-authserver
 
-echo "[update] Done."
+echo "[update] Done. Panel will restart shortly..."

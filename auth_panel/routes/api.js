@@ -266,7 +266,11 @@ router.post('/update', requireAuth, (req, res) => {
         if (err && err.code !== 0) {
             return res.status(500).json({ ok: false, output: output || detail });
         }
-        res.json({ ok: true, output });
+        // Send response BEFORE restarting the panel (restarting kills this process).
+        res.json({ ok: true, output: output + '\n[panel] Restarting panel in 2s...' });
+        setTimeout(() => {
+            execFile('sudo', ['systemctl', 'restart', 'bnet-panel'], () => {});
+        }, 2000);
     });
 });
 

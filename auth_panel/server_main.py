@@ -367,6 +367,46 @@ def _relay_pipe(src_sock, dst_sock, label, relay_id=None):
             _cleanup_udp_relay_session(relay_id)
 
 
+# UDP registration frames that have been sent but whose session hasn't appeared
+# in _udp_relay_sessions yet (TCP relay handshake still in flight).  Map:
+# (addr, relay_id) → (reg_frame_bytes, first_seen_ts)
+_udp_pending_regs = {}
+_UDP_PENDING_REG_TTL = 5.0   # seconds to retry a pending registration
+_UDP_SESSION_MAX_IDLE = 180  # seconds of no data before evicting a UDP session slot
+
+
+def _reap_stale_udp_sessions():
+    """Background thread: evict UDP relay sessions whose TCP pipe has gone away
+    but whose cleanup callback was never called (e.g. abrupt disconnect).
+    Also evict registration entries in _udp_pending_regs that are too old.
+    """
+    while True:
+        time.sleep(30)
+        try:
+            now = time.time()
+            with _udp_relay_lock:
+                # Evict UDP sessions with no matching TCP relay session
+                orphan_ids = [
+                    rid for rid in list(_udp_relay_sessions)
+                    if rid not in {int(tok[:8], 16) for tok in relay_sessions}
+                ]
+                for rid in orphan_ids:
+                    session = _udp_relay_sessions.pop(rid, None)
+                    if not session:
+                        continue
+                    stale_keys = [k for k in _udp_relay_map if k[1] == rid]
+                    for k in stale_keys:
+                        _udp_relay_map.pop(k, None)
+                    log_message(f"[relay-udp] Reaped orphaned UDP session relay_id={rid:#010x}")
+                # Evict stale pending registrations
+                stale_pend = [k for k, (_, ts) in _udp_pending_regs.items()
+                              if now - ts > _UDP_PENDING_REG_TTL]
+                for k in stale_pend:
+                    _udp_pending_regs.pop(k, None)
+        except Exception as exc:
+            log_message(f"[relay-udp] Reaper error: {exc}")
+
+
 def _udp_relay_loop(udp_relay_port):
     """Forward UDP audio/screen frames between relay-connected peers.
 
@@ -375,6 +415,13 @@ def _udp_relay_loop(udp_relay_port):
     """
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Large kernel socket buffers prevent drops during bursts (e.g. 3+ peers
+    # all registering simultaneously).  4 MB is well within Linux defaults.
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try:
+            udp_sock.setsockopt(socket.SOL_SOCKET, opt, 4 * 1024 * 1024)
+        except Exception:
+            pass
     try:
         udp_sock.bind((server_config.get("bind_host", "0.0.0.0"), udp_relay_port))
     except Exception as exc:
@@ -384,7 +431,8 @@ def _udp_relay_loop(udp_relay_port):
 
     while True:
         try:
-            data, addr = udp_sock.recvfrom(8192)
+            # 4096 B is ample: registration = 37 B, Opus frames ~60-120 B.
+            data, addr = udp_sock.recvfrom(4096)
         except Exception:
             continue
 
@@ -396,12 +444,17 @@ def _udp_relay_loop(udp_relay_port):
             try:
                 token = data[4:36].decode("ascii")
                 stream_type = data[36]
+                # relay_id is the first 8 hex chars of the token — validate now
+                # so a malformed token never enters the lock.
+                relay_id = int(token[:8], 16)
             except Exception:
                 continue
-            relay_id = int(token[:8], 16)
             with _udp_relay_lock:
                 session = _udp_relay_sessions.get(relay_id)
                 if session is None or session.get("token") != token:
+                    # TCP relay handshake may still be in flight.  Buffer this
+                    # registration so we can retry it once the session appears.
+                    _udp_pending_regs[(addr, relay_id)] = (data, time.time())
                     continue
                 slots = session["udp_slots"].setdefault(stream_type, [None, None])
                 if addr == slots[0] or addr == slots[1]:
@@ -448,6 +501,34 @@ def _udp_relay_loop(udp_relay_port):
         recv_relay_id = struct.unpack("!I", data[:4])[0]
         recv_stream_type = data[4]
         with _udp_relay_lock:
+            # Drain any pending registration for this sender if the session
+            # has now appeared (handles the TCP-handshake-still-in-flight case).
+            pend_key = (addr, recv_relay_id)
+            if pend_key in _udp_pending_regs:
+                pend_frame, _ = _udp_pending_regs.pop(pend_key)
+                # Re-process the buffered registration inline (session is now live).
+                try:
+                    pend_token = pend_frame[4:36].decode("ascii")
+                    pend_st = pend_frame[36]
+                    pend_session = _udp_relay_sessions.get(recv_relay_id)
+                    if pend_session and pend_session.get("token") == pend_token:
+                        slots = pend_session["udp_slots"].setdefault(pend_st, [None, None])
+                        if addr not in (slots[0], slots[1]):
+                            if slots[0] is None:
+                                slots[0] = addr
+                                _udp_relay_map[(addr, recv_relay_id)] = (pend_st, 1)
+                            elif slots[1] is None:
+                                slots[1] = addr
+                                _udp_relay_map[(addr, recv_relay_id)] = (pend_st, 0)
+                        try:
+                            udp_sock.sendto(_UDP_RELAY_MAGIC_BYTES + b"\x00", addr)
+                        except Exception:
+                            pass
+                        log_message(
+                            f"[relay-udp] Flushed pending reg {addr} relay_id={recv_relay_id:#010x}"
+                        )
+                except Exception:
+                    pass
             info = _udp_relay_map.get((addr, recv_relay_id))
             if info is None:
                 continue
@@ -1601,6 +1682,9 @@ async def run_server():
         target=_udp_relay_loop, args=(_udp_relay_port,), daemon=True
     )
     udp_relay_thread.start()
+
+    # Background thread: evict orphaned UDP relay sessions and stale pending regs.
+    threading.Thread(target=_reap_stale_udp_sessions, daemon=True, name="udp-reaper").start()
 
     server_running = True
     log_message(f"Listening on {server.getsockname()}")
